@@ -1,0 +1,31 @@
+# ESP-IDF build outputs and generated artifacts
+/build/
+/bootloader/build/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/compile_commands.json
+/project_description.json
+/config/
+/sdkconfig
+/sdkconfig.old
+/sdkconfig.*.old
+/managed_components/
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# IDE/editor files
+.vscode/settings.json
+.vscode/launch.json
+.vscode/*.code-workspace
+.clangd
+*.swp
+*.tmp
+*~
+
+# Misc
+.DS_Store
+*.log
+*.bak
