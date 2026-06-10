@@ -3,6 +3,10 @@
 #include "gauge_ui.h"
 #include "triumph_logo.h"
 
+LV_FONT_DECLARE(lv_font_montserrat_bold_28)
+LV_FONT_DECLARE(lv_font_montserrat_bold_36)
+LV_FONT_DECLARE(lv_font_montserrat_bold_44)
+
 /* ── Display geometry (800 × 800) ─────────────────────────────────────────── */
 #define CX  400
 #define CY  400
@@ -188,7 +192,7 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_style_set_line_width(&s_ticks_major, 3);
     lv_style_set_length(&s_ticks_major, TICK_MAJOR_LEN);
     lv_style_set_text_color(&s_ticks_major, COL_RED);
-    lv_style_set_text_font(&s_ticks_major, &lv_font_montserrat_20);
+    lv_style_set_text_font(&s_ticks_major, &lv_font_montserrat_bold_44);
 
     /* Scale widget */
     g_scale = lv_scale_create(parent);
@@ -222,7 +226,7 @@ void gauge_ui_init(lv_obj_t *parent)
     circle(parent, SOC_X, WARN_Y, WARN_OUTER_R, COL_WHITE);
     g_soc_inner = circle(parent, SOC_X, WARN_Y, WARN_INNER_R, COL_GREEN);
     centred_label(parent, SOC_X, WARN_Y + WARN_ROW_H, "SOC",
-                  COL_RED, &lv_font_montserrat_24);
+                  COL_RED, &lv_font_montserrat_bold_36);
 
     /* TEMP warning indicator */
     g_temp_outer = circle(parent, TEMP_X, WARN_Y, WARN_OUTER_R, COL_WHITE);
@@ -230,32 +234,32 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_obj_add_event_cb(g_temp_outer, temp_click_cb, LV_EVENT_CLICKED, NULL);
     g_temp_inner = circle(parent, TEMP_X, WARN_Y, WARN_INNER_R, COL_GREEN);
     centred_label(parent, TEMP_X, WARN_Y + WARN_ROW_H, "TMP",
-                  COL_RED, &lv_font_montserrat_24);
+                  COL_RED, &lv_font_montserrat_bold_36);
 
-    const lv_font_t *df = &lv_font_montserrat_26;
+    const lv_font_t *df = &lv_font_montserrat_bold_44;
 
     /* Left column: bat temp, SOC %, DC bus V (above SOC circle, top→bottom)
      * Fixed-width labels — text updates need only lv_label_set_text(), no recentre. */
-    g_bat_temp_lbl = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 3, 100, 1,
+    g_bat_temp_lbl = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 3, 150, 1,
                                  "20C",  COL_RED, df);
-    g_soc_pct_lbl  = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 2, 100, 1,
+    g_soc_pct_lbl  = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 2, 150, 1,
                                  "100%", COL_RED, df);
-    g_udc_lbl      = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H,     100, 1,
+    g_udc_lbl      = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H,     150, 1,
                                  "---",  COL_RED, df);
 
     /* Right column: worst-temp value and source (hidden until warning) */
-    g_temp_val_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H * 2, 100, 1,
+    g_temp_val_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H * 2, 150, 1,
                                  "20C", COL_RED, df);
     lv_obj_add_flag(g_temp_val_lbl, LV_OBJ_FLAG_HIDDEN);
 
-    g_temp_src_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H,     80, 1,
+    g_temp_src_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H,     150, 1,
                                  "BAT", COL_RED, df);
     lv_obj_add_flag(g_temp_src_lbl, LV_OBJ_FLAG_HIDDEN);
 
     /* Odometer */
     g_odo_bg = lv_obj_create(parent);
-    lv_obj_set_size(g_odo_bg, 220, 72);
-    lv_obj_set_pos(g_odo_bg, CX - 110, ODO_Y - 36);
+    lv_obj_set_size(g_odo_bg, 240, 120);
+    lv_obj_set_pos(g_odo_bg, CX - 120, ODO_Y - 60);
     lv_obj_set_style_bg_color(g_odo_bg, COL_BLACK, 0);
     lv_obj_set_style_bg_opa(g_odo_bg, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(g_odo_bg, 0, 0);
@@ -264,8 +268,8 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_obj_add_flag(g_odo_bg, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(g_odo_bg, odo_click_cb, LV_EVENT_CLICKED, NULL);
 
-    g_odo_lbl = fixed_label(parent, CX, ODO_Y, 200, 2,
-                            "ODO: 0\nTRP: 0.0", COL_RED, df);
+    g_odo_lbl = fixed_label(parent, CX, ODO_Y, 280, 2,
+                            "ODO: 0\nTRP: 0.0", COL_RED, &lv_font_montserrat_bold_36);
 }
 
 /* ─── gauge_ui_update_telemetry ─────────────────────────────────────────── */

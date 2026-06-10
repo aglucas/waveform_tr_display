@@ -6,6 +6,9 @@ idf_component_register(
         "triumph_logo.c"
         "boot_sound.c"
         "boot_sound_data.c"
+        "lv_font_montserrat_bold_28.c"
+        "lv_font_montserrat_bold_36.c"
+        "lv_font_montserrat_bold_44.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash

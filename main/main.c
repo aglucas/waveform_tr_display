@@ -22,11 +22,11 @@ static const char *TAG = "speedometer";
 #define MILEAGE_NS        "mileage"
 #define KEY_TOTAL         "total_mi"
 #define KEY_TRIP          "trip_mi"
-#define MILEAGE_SAVE_MI   5.0        /* save every N miles */
+#define MILEAGE_SAVE_MI   1.0        /* save every N miles */
 #define MILEAGE_UPD_MI    0.1        /* redraw every N miles */
 #define MILEAGE_TICK_MS   100        /* accumulation period */
 #define BLINK_INTERVAL_MS 400
-#define SOUND_VOLUME      70         /* speaker volume 0–100 */
+#define SOUND_VOLUME      100         /* speaker volume 0–100 */
 
 /* SD card mileage file — binary, 20 bytes */
 #define MILEAGE_FILE      BSP_SD_MOUNT_POINT "/odometer.bin"
