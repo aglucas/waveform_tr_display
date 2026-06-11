@@ -24,3 +24,8 @@ void gauge_ui_set_trip_cb(void (*cb)(void));
  * LVGL or blocking functions directly. */
 void gauge_ui_set_sound_cb(void (*cb)(void));
 void gauge_ui_set_alert_sound_cb(void (*cb)(void));
+
+/* Register a callback invoked when the needle pivot hub is tapped.
+ * Use to trigger a brightness step via a flag — do not call LVGL or
+ * blocking functions directly inside the callback. */
+void gauge_ui_set_brightness_cb(void (*cb)(void));

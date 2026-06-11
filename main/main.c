@@ -22,7 +22,7 @@ static const char *TAG = "speedometer";
 #define MILEAGE_NS        "mileage"
 #define KEY_TOTAL         "total_mi"
 #define KEY_TRIP          "trip_mi"
-#define MILEAGE_SAVE_MI   1.0        /* save every N miles */
+#define MILEAGE_SAVE_MI   0.1        /* save every N miles 0.1 is hard on flash drive fix PLP ciruit and change later */
 #define MILEAGE_UPD_MI    0.1        /* redraw every N miles */
 #define MILEAGE_TICK_MS   100        /* accumulation period */
 #define BLINK_INTERVAL_MS 400
@@ -48,17 +48,23 @@ static float  g_cur_speed = 0.0f;
 
 /* Dirty flags — set by timer callbacks, cleared by telemetry_task.
  * Keeps the Timer Service task stack usage minimal (no LVGL, no NVS). */
-static volatile bool g_mileage_dirty = false;
-static volatile bool g_blink_dirty   = false;
-static volatile bool g_save_dirty    = false;
-static volatile bool g_trip_reset    = false;
-static volatile bool    g_play_sound      = false;
-static volatile bool    s_sound_playing   = false;
+static volatile bool g_mileage_dirty    = false;
+static volatile bool g_blink_dirty      = false;
+static volatile bool g_save_dirty       = false;
+static volatile bool g_trip_reset       = false;
+static volatile bool g_play_sound       = false;
+static volatile bool s_sound_playing    = false;
 static volatile uint8_t g_sound_volume_req = SOUND_VOLUME;
+static volatile bool g_brightness_dirty = false;
 
-static void on_trip_reset(void)   { g_trip_reset = true; }
-static void on_play_sound(void)   { g_sound_volume_req = SOUND_VOLUME; g_play_sound = true; }
-static void on_alert_sound(void)  { g_sound_volume_req = 100;          g_play_sound = true; }
+/* Brightness bounce: 100 → 95 → … → 50 → 55 → … → 100, repeat */
+static int g_brightness      = 70;
+static int g_brightness_step = -10;
+
+static void on_trip_reset(void)       { g_trip_reset = true; }
+static void on_play_sound(void)       { g_sound_volume_req = SOUND_VOLUME; g_play_sound = true; }
+static void on_alert_sound(void)      { g_sound_volume_req = 100;          g_play_sound = true; }
+static void on_brightness_step(void)  { g_brightness_dirty = true; }
 static void boot_sound_task(void *arg);
 
 /* ── Button GPIOs (adjust to match your hardware wiring) ──────────────────── */
@@ -238,6 +244,16 @@ static void telemetry_task(void *arg)
             save_mileage();
         }
 
+        if (g_brightness_dirty) {
+            g_brightness_dirty = false;
+            int prev = g_brightness;
+            g_brightness += g_brightness_step;
+            if (g_brightness >= 100) { g_brightness = 100; g_brightness_step = -10; }
+            else if (g_brightness <= 30) { g_brightness = 30;  g_brightness_step =  10; }
+            esp_err_t err = bsp_display_brightness_set(g_brightness);
+            ESP_LOGI(TAG, "Brightness: %d%% -> %d%% (err=%d)", prev, g_brightness, err);
+        }
+
         if (g_play_sound && !s_sound_playing) {
             g_play_sound = false;
             s_sound_playing = true;
@@ -343,6 +359,7 @@ void app_main(void)
     gauge_ui_set_trip_cb(on_trip_reset);
     gauge_ui_set_sound_cb(on_play_sound);
     gauge_ui_set_alert_sound_cb(on_alert_sound);
+    gauge_ui_set_brightness_cb(on_brightness_step);
     bsp_display_unlock();
 
     /* minimp3's decode scratch uses ~15 KB of stack — run in its own task */

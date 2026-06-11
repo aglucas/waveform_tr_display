@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include "esp_log.h"
 #include "gauge_ui.h"
 #include "triumph_logo.h"
 
@@ -76,13 +77,22 @@ static void odo_click_cb(lv_event_t *e)
 }
 
 /* Sound callbacks — tap uses normal volume, alert uses full volume */
-static void (*s_sound_cb)(void)  = NULL;   /* temp circle tapped */
-static void (*s_alert_cb)(void)  = NULL;   /* temp transitions to red */
+static void (*s_sound_cb)(void)       = NULL;
+static void (*s_alert_cb)(void)       = NULL;
 static bool s_prev_temp_alert = false;
 
 static void temp_click_cb(lv_event_t *e)
 {
     if (s_sound_cb) s_sound_cb();
+}
+
+/* Brightness step callback — pivot hub tapped */
+static void (*s_brightness_cb)(void)  = NULL;
+
+static void hub_click_cb(lv_event_t *e)
+{
+    ESP_LOGI("gauge_ui", "Hub dot pressed");
+    if (s_brightness_cb) s_brightness_cb();
 }
 
 /* Alert blink state */
@@ -218,9 +228,10 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_obj_add_style(g_needle, &s_needle_line, 0);
     lv_scale_set_line_needle_value(g_scale, g_needle, NEEDLE_LEN, 0);
 
-    /* Hub dot (drawn on top of needle base) */
-    lv_obj_t *hub = circle(parent, CX, CY, 12, COL_RED);
-    (void)hub;
+    /* Hub dot — clickable for brightness control */
+    lv_obj_t *hub = circle(parent, CX, CY, WARN_OUTER_R, COL_RED);
+    lv_obj_add_flag(hub, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(hub, hub_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* SOC warning indicator */
     circle(parent, SOC_X, WARN_Y, WARN_OUTER_R, COL_WHITE);
@@ -397,6 +408,11 @@ void gauge_ui_set_sound_cb(void (*cb)(void))
 void gauge_ui_set_alert_sound_cb(void (*cb)(void))
 {
     s_alert_cb = cb;
+}
+
+void gauge_ui_set_brightness_cb(void (*cb)(void))
+{
+    s_brightness_cb = cb;
 }
 
 /* ─── gauge_ui_blink_tick ───────────────────────────────────────────────── */
