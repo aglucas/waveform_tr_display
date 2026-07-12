@@ -8,6 +8,10 @@
 LV_FONT_DECLARE(lv_font_montserrat_bold_28)
 LV_FONT_DECLARE(lv_font_montserrat_bold_36)
 LV_FONT_DECLARE(lv_font_montserrat_bold_44)
+/* Value-only font for the large readout: digits plus ".-%CVW" and space. The
+ * title line above it uses the 36 px font (full ASCII), which keeps this one
+ * to 16 glyphs — a full-ASCII 88 px face would cost ~900 kB of flash. */
+LV_FONT_DECLARE(lv_font_montserrat_bold_88)
 
 /* ── Display geometry (800 × 800) ─────────────────────────────────────────── */
 #define CX  400
@@ -33,6 +37,16 @@ LV_FONT_DECLARE(lv_font_montserrat_bold_44)
 #define WARN_OUTER_R     30
 #define WARN_INNER_R     22
 #define WARN_ROW_H       50    /* vertical gap between label rows       */
+
+/* Large readout — sits under the 50 mph point (50 of 100 on a 300 deg sweep from
+ * 7 o'clock lands at 12 o'clock, i.e. straight up). It overlaps the needle's
+ * travel near 50 mph, so it's backed by an opaque plaque and created last, which
+ * keeps it legible on top rather than fighting the needle for contrast. */
+#define BIG_CY           200   /* plaque centre                          */
+#define BIG_W            340
+#define BIG_H            180
+#define BIG_TITLE_Y      150
+#define BIG_VAL_Y        232
 
 #define ODO_Y            680
 /* Car-mode readout, just below the ODO/TRP plaque (which spans y 620..740).
@@ -75,6 +89,9 @@ static lv_obj_t *g_odo_lbl;
 static lv_obj_t *g_odo_bg;
 static lv_obj_t *g_mode_lbl;
 static lv_obj_t *g_whmi_lbl;
+static lv_obj_t *g_big_bg;
+static lv_obj_t *g_big_title;
+static lv_obj_t *g_big_val;
 
 /* Trip reset callback */
 static void (*s_trip_cb)(void) = NULL;
@@ -103,36 +120,140 @@ static void hub_click_cb(lv_event_t *e)
     if (s_brightness_cb) s_brightness_cb();
 }
 
-/* Wh/mile readout — cached trip & charge values plus which one is shown.
- * Tapping the readout toggles between them; the value is prefixed 'T' or 'C'. */
+/* Wh/mile readout — three meters, cycled by tapping the large readout:
+ *   T = since trip reset      C = since last charge      M = last 10 miles
+ * M is trip-based (main.c hands us the window deltas), so it resets with T. */
+typedef enum {
+    WHMI_TRIP = 0,
+    WHMI_CHARGE,
+    WHMI_ROLL,
+    WHMI_MODE_COUNT,
+} whmi_mode_t;
+
 static double s_whmi_trip_wh = 0.0, s_whmi_trip_mi = 0.0;
 static double s_whmi_chg_wh  = 0.0, s_whmi_chg_mi  = 0.0;
-static bool   s_whmi_show_charge = false;
+static double s_whmi_roll_wh = 0.0, s_whmi_roll_mi = 0.0;
+static whmi_mode_t s_whmi_mode = WHMI_TRIP;
+
+/* The (wh, mi) pair and tag letter for the currently selected meter. */
+static void whmi_selected(double *wh, double *mi, char *tag)
+{
+    switch (s_whmi_mode) {
+        case WHMI_CHARGE: *wh = s_whmi_chg_wh;  *mi = s_whmi_chg_mi;  *tag = 'C'; break;
+        case WHMI_ROLL:   *wh = s_whmi_roll_wh; *mi = s_whmi_roll_mi; *tag = 'M'; break;
+        default:          *wh = s_whmi_trip_wh; *mi = s_whmi_trip_mi; *tag = 'T'; break;
+    }
+}
+
+/* Below ~0.1 mi the ratio is noise-dominated, so hold at 0. fabs() makes the
+ * reading polarity-independent (the energy counter's sign depends on wiring). */
+static int whmi_value(double wh, double mi)
+{
+    if (mi < 0.1) return 0;
+    double v = fabs(wh) / mi;
+    if (v > 999.0) v = 999.0;   /* keep it to 3 digits */
+    return (int)(v + 0.5);
+}
 
 static void whmi_render(void)
 {
     char buf[24];
-    double wh  = s_whmi_show_charge ? s_whmi_chg_wh : s_whmi_trip_wh;
-    double mi  = s_whmi_show_charge ? s_whmi_chg_mi : s_whmi_trip_mi;
-    char   tag = s_whmi_show_charge ? 'C' : 'T';
-    int    whmi = 0;
-    /* Below ~0.1 mi the ratio is noise-dominated, so hold at 0. fabs() makes the
-     * reading polarity-independent (the IVT counter's sign depends on wiring). */
-    if (mi >= 0.1) {
-        double v = fabs(wh) / mi;
-        if (v > 999.0) v = 999.0;   /* keep it to 3 digits */
-        whmi = (int)(v + 0.5);
-    }
-    snprintf(buf, sizeof(buf), "%c %d\nWh/mi", tag, whmi);
+    double wh, mi;
+    char   tag;
+    whmi_selected(&wh, &mi, &tag);
+    snprintf(buf, sizeof(buf), "%c %d\nWh/mi", tag, whmi_value(wh, mi));
     lv_label_set_text(g_whmi_lbl, buf);
 }
 
-/* Runs in LVGL task context (under the display lock), so updating the label
- * directly here is safe — no flag/hand-off needed. */
-static void whmi_click_cb(lv_event_t *e)
+/* ─── Large readout ──────────────────────────────────────────────────────────
+ * One value at a time, promoted by tapping its small label. Tapping the small
+ * label of the value already shown demotes it (clears the area); tapping a
+ * different one swaps it in. The latest telemetry is cached here so the big
+ * readout can re-render on demand without waiting for the next frame. */
+typedef enum {
+    BIG_NONE = 0,
+    BIG_SOC,
+    BIG_BAT,
+    BIG_UDC,
+    BIG_WHMI,
+} big_item_t;
+
+static big_item_t s_big_item = BIG_NONE;
+static float s_soc_pct = 0.0f, s_bat_c = 0.0f, s_udc_v = 0.0f;
+
+/* Value strings must stay within the 88 px font's glyph set (digits .-%CVW). */
+static void big_render(void)
 {
-    s_whmi_show_charge = !s_whmi_show_charge;
-    whmi_render();
+    if (s_big_item == BIG_NONE) {
+        lv_obj_add_flag(g_big_bg,    LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_big_title, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_big_val,   LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    char title[16], val[12];
+    switch (s_big_item) {
+        case BIG_SOC:
+            snprintf(title, sizeof(title), "SOC");
+            snprintf(val,   sizeof(val),   "%d%%", (int)s_soc_pct);
+            break;
+        case BIG_BAT:
+            snprintf(title, sizeof(title), "BAT TEMP");
+            snprintf(val,   sizeof(val),   "%dC", (int)s_bat_c);
+            break;
+        case BIG_UDC:
+            snprintf(title, sizeof(title), "DC BUS");
+            snprintf(val,   sizeof(val),   "%dV", (int)s_udc_v);
+            break;
+        case BIG_WHMI: {
+            double wh, mi;
+            char   tag;
+            whmi_selected(&wh, &mi, &tag);
+            const char *name = (s_whmi_mode == WHMI_CHARGE) ? "CHG Wh/mi"
+                             : (s_whmi_mode == WHMI_ROLL)   ? "LAST 10 MI"
+                                                            : "TRIP Wh/mi";
+            snprintf(title, sizeof(title), "%s", name);
+            snprintf(val,   sizeof(val),   "%d", whmi_value(wh, mi));
+            break;
+        }
+        default:
+            return;
+    }
+
+    lv_label_set_text(g_big_title, title);
+    lv_label_set_text(g_big_val,   val);
+    lv_obj_clear_flag(g_big_bg,    LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_big_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(g_big_val,   LV_OBJ_FLAG_HIDDEN);
+}
+
+/* Tapping the small label: promote it, or demote if it's the one already up. */
+static void big_toggle(big_item_t item)
+{
+    s_big_item = (s_big_item == item) ? BIG_NONE : item;
+    big_render();
+}
+
+/* All of these run in LVGL task context (under the display lock), so touching
+ * widgets directly is safe here — no flag/hand-off needed. */
+static void soc_lbl_click_cb(lv_event_t *e) { big_toggle(BIG_SOC); }
+static void bat_lbl_click_cb(lv_event_t *e) { big_toggle(BIG_BAT); }
+static void udc_lbl_click_cb(lv_event_t *e) { big_toggle(BIG_UDC); }
+static void whmi_click_cb   (lv_event_t *e) { big_toggle(BIG_WHMI); }
+
+/* Tapping the large readout itself: for Wh/mi it cycles Trip -> Charge -> last
+ * 10 mi -> Trip (the small label follows); for anything else there's nothing to
+ * cycle, so it just clears the area. */
+static void big_click_cb(lv_event_t *e)
+{
+    if (s_big_item == BIG_WHMI) {
+        s_whmi_mode = (whmi_mode_t)((s_whmi_mode + 1) % WHMI_MODE_COUNT);
+        whmi_render();   /* keep the small label in sync */
+        big_render();
+    } else {
+        s_big_item = BIG_NONE;
+        big_render();
+    }
 }
 
 /* Alert blink state */
@@ -313,6 +434,14 @@ void gauge_ui_init(lv_obj_t *parent)
     g_udc_lbl      = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H,     150, 1,
                                  "---",  COL_RED, df);
 
+    /* Each small value promotes itself into the large readout when tapped. */
+    lv_obj_add_flag(g_bat_temp_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_bat_temp_lbl, bat_lbl_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(g_soc_pct_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_soc_pct_lbl, soc_lbl_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(g_udc_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_udc_lbl, udc_lbl_click_cb, LV_EVENT_CLICKED, NULL);
+
     /* Efficiency (Wh/mile) — under the SOC block, in the gap above the ODO
      * plaque. Two lines: the tag+3-digit value ("T 250") over a "Wh/mi" unit
      * label. Tappable to toggle between the Trip and Charge meters. */
@@ -348,6 +477,30 @@ void gauge_ui_init(lv_obj_t *parent)
     /* Car mode (Off / Run / Charging / …) directly under the TRP line */
     g_mode_lbl = fixed_label(parent, CX, MODE_Y, 280, 1,
                              "---", COL_WHITE, &lv_font_montserrat_bold_28);
+
+    /* ── Large readout — created LAST so it draws over the needle ──────────── */
+    g_big_bg = lv_obj_create(parent);
+    lv_obj_set_size(g_big_bg, BIG_W, BIG_H);
+    lv_obj_set_pos(g_big_bg, CX - BIG_W / 2, BIG_CY - BIG_H / 2);
+    lv_obj_set_style_bg_color(g_big_bg, COL_BLACK, 0);
+    lv_obj_set_style_bg_opa(g_big_bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(g_big_bg, COL_RED, 0);
+    lv_obj_set_style_border_width(g_big_bg, 3, 0);
+    lv_obj_set_style_radius(g_big_bg, 10, 0);
+    lv_obj_clear_flag(g_big_bg, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_big_bg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_big_bg, big_click_cb, LV_EVENT_CLICKED, NULL);
+
+    g_big_title = fixed_label(parent, CX, BIG_TITLE_Y, BIG_W - 20, 1,
+                              "SOC", COL_WHITE, &lv_font_montserrat_bold_36);
+    g_big_val   = fixed_label(parent, CX, BIG_VAL_Y,   BIG_W - 20, 1,
+                              "0", COL_RED, &lv_font_montserrat_bold_88);
+
+    /* The two labels are left non-clickable (the default), so LVGL's hit test
+     * skips them and the tap lands on the plaque underneath — that's what makes
+     * the whole readout, text included, one tap target for big_click_cb. */
+
+    big_render();   /* starts hidden (BIG_NONE) */
 }
 
 /* ─── gauge_ui_update_telemetry ─────────────────────────────────────────── */
@@ -356,13 +509,26 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
 {
     char buf[32];
 
+    /* The pack contactors are only closed in Run or Charge. In any other opmode
+     * the DC bus isn't energised and SOC isn't meaningful — the sender sends
+     * placeholder values (DEFAULT_UDC_V / DEFAULT_SOC_PCT) rather than a real
+     * reading. Judging those placeholders is what caused false warnings: the
+     * 400 V default sits exactly on TH_UDC's warning threshold (hw = 400). So
+     * gate both the readout and the severity on this one flag. */
+    bool bus_live = (t->opmode == CAR_MODE_RUN || t->opmode == CAR_MODE_CHARGE);
+
+    /* Cache for the large readout, which re-renders from these on demand. */
+    s_soc_pct = t->soc_pct;
+    s_bat_c   = t->temp_bat_c;
+    s_udc_v   = bus_live ? t->udc_v : 0.0f;   /* big readout shows 0 V too */
+
     /* Needle */
     int spd = (int)(t->speed_mph < 0 ? 0 : t->speed_mph > MAX_SPEED
                     ? MAX_SPEED : t->speed_mph);
     lv_scale_set_line_needle_value(g_scale, g_needle, NEEDLE_LEN, spd);
 
-    /* DC bus voltage label */
-    snprintf(buf, sizeof(buf), "%dV", (int)t->udc_v);
+    /* DC bus voltage label — 0 V when the bus isn't live (no reading to show) */
+    snprintf(buf, sizeof(buf), "%dV", bus_live ? (int)t->udc_v : 0);
     lv_label_set_text(g_udc_lbl, buf);
 
     /* SOC % label */
@@ -379,14 +545,14 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
     snprintf(buf, sizeof(buf), "%dC", (int)t->temp_bat_c);
     lv_label_set_text(g_bat_temp_lbl, buf);
 
-    /* SOC indicator: worst of SOC% and bus voltage.
-     * SOC is only meaningful while the car is in Run — ignore it otherwise
-     * so a stale/idle reading doesn't nuisance-trigger the warning. */
-    bool in_run = (t->opmode == CAR_MODE_RUN);
-    int soc_sev = (!in_run) ? 0
+    /* SOC indicator: worst of SOC% and bus voltage. Both are only meaningful
+     * with the contactors closed (Run or Charge); outside that we're looking at
+     * placeholders, so force severity to 0 rather than grading a made-up number.
+     * A 0 V bus is the expected resting state, not a fault — hence no warning. */
+    int soc_sev = (!bus_live) ? 0
                 : (t->soc_pct < SOC_ALERT_PCT) ? 2
                 : (t->soc_pct < SOC_WARN_PCT)  ? 1 : 0;
-    int udc_sev = severity(t->udc_v, &TH_UDC);
+    int udc_sev = (!bus_live) ? 0 : severity(t->udc_v, &TH_UDC);
     int combined = soc_sev > udc_sev ? soc_sev : udc_sev;
 
     g_soc_alert = false;
@@ -456,6 +622,8 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
         lv_obj_add_flag(g_temp_val_lbl, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_temp_src_lbl, LV_OBJ_FLAG_HIDDEN);
     }
+
+    big_render();   /* keep the promoted value live */
 }
 
 /* ─── gauge_ui_update_mileage ───────────────────────────────────────────── */
@@ -473,11 +641,14 @@ void gauge_ui_update_mileage(double total_miles, double trip_miles)
 /* ─── gauge_ui_update_energy ────────────────────────────────────────────── */
 
 void gauge_ui_update_energy(double trip_wh, double trip_miles,
-                            double charge_wh, double charge_miles)
+                            double charge_wh, double charge_miles,
+                            double roll_wh, double roll_miles)
 {
     s_whmi_trip_wh = trip_wh;   s_whmi_trip_mi = trip_miles;
     s_whmi_chg_wh  = charge_wh; s_whmi_chg_mi  = charge_miles;
-    whmi_render();   /* honours the current trip/charge toggle */
+    s_whmi_roll_wh = roll_wh;   s_whmi_roll_mi = roll_miles;
+    whmi_render();   /* honours the current T/C/M selection */
+    big_render();    /* keep the promoted value live if it's Wh/mi */
 }
 
 /* ─── gauge_ui_set_trip_cb ───────────────────────────────────────────────── */

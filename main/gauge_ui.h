@@ -11,11 +11,15 @@ void gauge_ui_update_telemetry(const telemetry_t *t);
 /* Update odometer readouts. */
 void gauge_ui_update_mileage(double total_miles, double trip_miles);
 
-/* Update the efficiency readout (Wh/mile, shown under the SOC block). Pass both
- * the trip and since-charge energy (Wh) and distance (miles); the readout shows
- * whichever meter is currently selected (tap to toggle Trip 'T' / Charge 'C'). */
+/* Update the efficiency readout (Wh/mile, shown under the SOC block). Pass the
+ * energy (Wh) and distance (miles) for each of the three meters; the readout
+ * shows whichever is selected, cycled by tapping the large readout:
+ *   trip   'T' — since the last trip reset
+ *   charge 'C' — since the last transition into Charge
+ *   roll   'M' — over the last 10 miles of trip distance (window deltas) */
 void gauge_ui_update_energy(double trip_wh, double trip_miles,
-                            double charge_wh, double charge_miles);
+                            double charge_wh, double charge_miles,
+                            double roll_wh, double roll_miles);
 
 /* Toggle the blink state of any active alert indicators. */
 void gauge_ui_blink_tick(void);

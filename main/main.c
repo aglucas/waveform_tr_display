@@ -35,15 +35,20 @@ static const char *TAG = "speedometer";
 #define BLINK_INTERVAL_MS 400
 #define SOUND_VOLUME      100         /* speaker volume 0–100 */
 
-/* SD card mileage file. Two on-disk layouts share MILEAGE_MAGIC:
+/* SD card mileage file. Every layout shares MILEAGE_MAGIC and is a prefix of the
+ * next EXCEPT v2, whose field order differs (it predates charge_mi):
  *   legacy (20 bytes): magic + total_mi + trip_mi
- *   current (52 bytes): the above + charge_mi + total_wh + trip_wh + charge_wh
- * load_mileage() reads whichever length is on disk, so a card written by the
- * pre-energy firmware upgrades cleanly (the new counters start at 0, odometer
- * preserved). */
+ *   v2     (44 bytes): + total_wh + trip_wh + charge_wh   [no charge_mi]
+ *   v3     (52 bytes): + charge_mi, Wh fields shifted     [no last_soc]
+ *   current(60 bytes): + last_soc
+ * load_mileage() reads whichever length is on disk. Because current is a strict
+ * append onto v3, a v3 card is migrated by simply reading its first 52 bytes —
+ * the fields land in the right place and last_soc defaults to 0. Only v2 needs a
+ * real remap (see mileage_file_v2_t). */
 #define MILEAGE_FILE          BSP_SD_MOUNT_POINT "/odometer.bin"
 #define MILEAGE_MAGIC         0xA55A1234U
 #define MILEAGE_LEGACY_BYTES  20           /* sizeof the pre-energy layout */
+#define MILEAGE_V3_BYTES      52           /* pre-last_soc layout           */
 
 /* Reject an implausible frame-to-frame jump in the IVT energy counter (a shunt
  * reset, a dropped/garbled frame). Well above one telemetry tick of real drive
@@ -58,6 +63,7 @@ typedef struct __attribute__((packed)) {
     double   total_wh;    /* lifetime energy, Wh (accumulated IVT deltas) */
     double   trip_wh;     /* energy since last trip reset, Wh             */
     double   charge_wh;   /* energy since last transition into Charge, Wh */
+    double   last_soc;    /* last SOC seen with the contactors closed, %  */
 } mileage_file_t;
 
 /* Intermediate layout that shipped briefly between the legacy file and the
@@ -100,14 +106,86 @@ static double g_energy_prev      = 0.0;   /* last raw counter value seen        
 static bool   g_energy_have_prev = false; /* false until the first valid frame  */
 static bool   s_was_charge_mode  = false; /* tracks CAR_MODE_CHARGE edge        */
 
+/* Last SOC read with the contactors closed. Outside Run/Charge the sender only
+ * has a placeholder to send (DEFAULT_SOC_PCT), so we show this remembered value
+ * instead — and persist it, so it survives a power cycle and the gauge still
+ * reads something meaningful when you walk up to a parked car. */
+static double g_last_soc = 0.0;
+static bool   s_was_bus_live = false;   /* tracks the Run/Charge -> off edge */
+
+/* ── Rolling efficiency window ────────────────────────────────────────────────
+ * Wh/mile over the last ROLL_WINDOW_MI of TRIP distance, so it resets with the
+ * trip. We snapshot (trip_mi, trip_wh) into a ring every ROLL_BUCKET_MI; once the
+ * ring is full its oldest entry is exactly one window back, so the rolling value
+ * is just the delta between now and that entry — no per-sample decay or IIR to
+ * tune, and it's exact rather than approximate.
+ *
+ * Before the ring fills, the oldest entry is the trip origin, so it reads as the
+ * trip average until 10 miles are on the clock — which is the sensible warm-up.
+ *
+ * RAM-only (~1.6 kB): a reboot restarts the window even though the trip counters
+ * themselves persist, so after a power cycle M reads as "since reboot" until it
+ * refills. Persisting the ring would mean carrying it in odometer.bin. */
+#define ROLL_WINDOW_MI  10.0
+#define ROLL_BUCKET_MI  0.1
+#define ROLL_N          ((int)(ROLL_WINDOW_MI / ROLL_BUCKET_MI) + 1)   /* 101 */
+
+typedef struct { double mi, wh; } roll_sample_t;
+static roll_sample_t g_roll[ROLL_N];
+static int    g_roll_head    = 0;   /* next write slot */
+static int    g_roll_count   = 0;
+static double g_roll_last_mi = 0.0; /* trip_mi at the last push */
+
+/* Seed the window at the current trip point (called at boot and on trip reset). */
+static void roll_reset(void)
+{
+    g_roll[0].mi   = g_trip_mi;
+    g_roll[0].wh   = g_trip_wh;
+    g_roll_head    = 1 % ROLL_N;
+    g_roll_count   = 1;
+    g_roll_last_mi = g_trip_mi;
+}
+
+/* Push a snapshot once the trip has advanced another bucket. */
+static void roll_update(void)
+{
+    if (g_roll_count == 0)                      { roll_reset(); return; }
+    if (g_trip_mi - g_roll_last_mi < ROLL_BUCKET_MI) return;
+
+    g_roll[g_roll_head].mi = g_trip_mi;
+    g_roll[g_roll_head].wh = g_trip_wh;
+    g_roll_head = (g_roll_head + 1) % ROLL_N;
+    if (g_roll_count < ROLL_N) g_roll_count++;
+    g_roll_last_mi = g_trip_mi;
+}
+
+/* Window deltas. Handed to the UI as a (wh, mi) pair so it derives Wh/mi exactly
+ * the same way it does for the trip and charge meters. */
+static void roll_window(double *wh, double *mi)
+{
+    if (g_roll_count == 0) { *wh = 0.0; *mi = 0.0; return; }
+    int oldest = (g_roll_head - g_roll_count + ROLL_N) % ROLL_N;
+    *mi = g_trip_mi - g_roll[oldest].mi;
+    *wh = g_trip_wh - g_roll[oldest].wh;
+}
+
 /* Dirty flags — set by timer callbacks, cleared by telemetry_task.
  * Keeps the Timer Service task stack usage minimal (no LVGL, no NVS). */
 static volatile bool g_mileage_dirty    = false;
 static volatile bool g_blink_dirty      = false;
 static volatile bool g_save_dirty       = false;
 static volatile bool g_trip_reset       = false;
-static volatile bool g_play_sound       = false;
-static volatile bool s_sound_playing    = false;
+/* Which sound to play. The fault alarm is a different sound from the chime (not
+ * just the same clip louder), and it preempts — see the dispatcher below. */
+typedef enum {
+    SND_NONE = 0,
+    SND_CHIME,   /* boot jingle / tap feedback (the embedded MP3) */
+    SND_ERROR,   /* synthesised two-tone fault alarm              */
+} sound_id_t;
+
+static volatile sound_id_t g_sound_req     = SND_NONE;   /* pending request */
+static volatile sound_id_t s_sound_current = SND_NONE;   /* what's playing  */
+static volatile bool       s_sound_playing = false;
 static volatile uint8_t g_sound_volume_req = SOUND_VOLUME;
 static volatile bool g_brightness_dirty = false;
 static volatile bool g_energy_dirty     = false;
@@ -117,10 +195,10 @@ static int g_brightness      = 70;
 static int g_brightness_step = -10;
 
 static void on_trip_reset(void)       { g_trip_reset = true; }
-static void on_play_sound(void)       { g_sound_volume_req = SOUND_VOLUME; g_play_sound = true; }
-static void on_alert_sound(void)      { g_sound_volume_req = 100;          g_play_sound = true; }
+static void on_play_sound(void)       { g_sound_volume_req = SOUND_VOLUME; g_sound_req = SND_CHIME; }
+static void on_alert_sound(void)      { g_sound_volume_req = 100;          g_sound_req = SND_ERROR; }
 static void on_brightness_step(void)  { g_brightness_dirty = true; }
-static void boot_sound_task(void *arg);
+static void sound_task(void *arg);
 
 /* ── Button GPIOs (adjust to match your hardware wiring) ──────────────────── */
 #define BTN_UP   GPIO_NUM_32 // 40 pin header pin 26
@@ -149,9 +227,15 @@ static void log_counters(const char *what)
 
     ESP_LOGI(TAG, "%s | MI  total=%.4f trip=%.4f charge=%.4f | integrated %.1f min -> implied avg %.1f mph",
              what, g_total_mi, g_trip_mi, g_charge_mi, moving_min, implied_mph);
-    ESP_LOGI(TAG, "%s | WH  total=%.2f trip=%.2f charge=%.2f", what,
-             g_total_wh, g_trip_wh, g_charge_wh);
+    ESP_LOGI(TAG, "%s | WH  total=%.2f trip=%.2f charge=%.2f | last_soc=%.1f%%", what,
+             g_total_wh, g_trip_wh, g_charge_wh, g_last_soc);
     uint32_t age_ms = (uint32_t)((xTaskGetTickCount() - g_last_frame_tick) * portTICK_PERIOD_MS);
+    double rwh, rmi;
+    roll_window(&rwh, &rmi);
+    double roll_whmi = (rmi >= 0.1) ? fabs(rwh) / rmi : 0.0;
+    ESP_LOGI(TAG, "%s | EFF roll(M)=%.1f Wh/mi over %.2f mi (%d/%d buckets)",
+             what, roll_whmi, rmi, g_roll_count, ROLL_N);
+
     ESP_LOGI(TAG, "%s | EFF trip=%.1f Wh/mi  charge=%.1f Wh/mi | IVT raw=%.2f Wh (have_prev=%d) "
                   "speed=%.2f mph (frame age=%lu ms%s)",
              what, trip_whmi, chg_whmi, g_energy_prev, (int)g_energy_have_prev,
@@ -180,8 +264,13 @@ static void load_mileage(void)
             bool read_ok = false;
 
             if (sz >= (long)sizeof(f)) {
-                layout  = "current(52)";
+                layout  = "current(60)";
                 read_ok = (fread(&f, sizeof(f), 1, fp) == 1);
+            } else if (sz == MILEAGE_V3_BYTES) {
+                /* Strict prefix of the current layout — the fields land where
+                 * they belong; only last_soc is missing (stays 0 from memset). */
+                layout  = "v3(52)";
+                read_ok = (fread(&f, MILEAGE_V3_BYTES, 1, fp) == 1);
             } else if (sz == MILEAGE_V2_BYTES) {
                 /* Migrate the intermediate layout: same fields but no charge_mi,
                  * so the Wh values sit 8 bytes earlier than they do now. Read it
@@ -211,7 +300,9 @@ static void load_mileage(void)
                             && isfinite(f.trip_mi)   && f.trip_mi   >= 0.0
                             && isfinite(f.charge_mi) && f.charge_mi >= 0.0
                             && isfinite(f.total_wh)  && isfinite(f.trip_wh)
-                            && isfinite(f.charge_wh);
+                            && isfinite(f.charge_wh)
+                            && isfinite(f.last_soc)  && f.last_soc >= 0.0
+                                                     && f.last_soc <= 100.0;
 
             ESP_LOGI(TAG, "SD: odometer.bin %ld bytes, layout=%s, read=%d magic=%d(0x%08lX) vals=%d",
                      sz, layout, (int)read_ok, (int)magic_ok,
@@ -224,6 +315,7 @@ static void load_mileage(void)
                 g_total_wh  = f.total_wh;
                 g_trip_wh   = f.trip_wh;
                 g_charge_wh = f.charge_wh;
+                g_last_soc  = f.last_soc;
                 log_counters("LOAD");
                 return;
             }
@@ -260,7 +352,7 @@ static void save_mileage_fast(void)
         return;
     }
     mileage_file_t f = { MILEAGE_MAGIC, g_total_mi, g_trip_mi, g_charge_mi,
-                         g_total_wh, g_trip_wh, g_charge_wh };
+                         g_total_wh, g_trip_wh, g_charge_wh, g_last_soc };
     FILE *fp = fopen(MILEAGE_FILE, "wb");
     if (fp) {
         size_t n = fwrite(&f, 1, sizeof(f), fp);
@@ -277,7 +369,7 @@ static void save_mileage(void)
     /* SD card — primary */
     if (s_sd_mounted) {
         mileage_file_t f = { MILEAGE_MAGIC, g_total_mi, g_trip_mi, g_charge_mi,
-                             g_total_wh, g_trip_wh, g_charge_wh };
+                             g_total_wh, g_trip_wh, g_charge_wh, g_last_soc };
         FILE *fp = fopen(MILEAGE_FILE, "wb");
         if (fp) {
             size_t n = fwrite(&f, 1, sizeof(f), fp);
@@ -366,7 +458,7 @@ static void telemetry_task(void *arg)
             bool is_run_mode = (t.opmode == CAR_MODE_RUN);
             if (is_run_mode && !s_was_run_mode) {
                 g_sound_volume_req = SOUND_VOLUME;
-                g_play_sound = true;
+                g_sound_req = SND_CHIME;
             }
             s_was_run_mode = is_run_mode;
 
@@ -402,6 +494,10 @@ static void telemetry_task(void *arg)
                               "re-baselined to %.2f Wh (rejects=%lu)",
                          d, ENERGY_MAX_STEP_WH, e, (unsigned long)s_energy_rejects);
 
+            /* Advance the rolling-efficiency window (no-op until the trip crosses
+             * the next 0.1 mi bucket). */
+            roll_update();
+
             /* Periodic snapshot so miles vs Wh can be watched while driving. */
             static TickType_t last_dbg = 0;
             TickType_t now_dbg = xTaskGetTickCount();
@@ -419,6 +515,22 @@ static void telemetry_task(void *arg)
             }
             s_was_charge_mode = is_charge_mode;
 
+            /* SOC is only real with the contactors closed. While they are, keep
+             * remembering it; while they aren't, the sender can only send a
+             * placeholder — so substitute the last real reading into the frame
+             * before it reaches the UI. Saving on the falling edge (the moment we
+             * stop getting real data) is what makes the value survive shutdown.
+             * The UI still suppresses the SOC warning outside Run/Charge, so this
+             * is displayed but never graded. */
+            bool bus_live = is_run_mode || is_charge_mode;
+            if (bus_live) {
+                g_last_soc = t.soc_pct;
+            } else {
+                if (s_was_bus_live) g_save_dirty = true;   /* just went dark — persist it */
+                t.soc_pct = (float)g_last_soc;
+            }
+            s_was_bus_live = bus_live;
+
             g_cur_speed = new_speed;
             g_last_frame_tick = xTaskGetTickCount();   /* marks g_cur_speed as fresh */
             prev_speed  = new_speed;
@@ -435,7 +547,13 @@ static void telemetry_task(void *arg)
             if (bsp_display_lock(500) == ESP_OK) {
                 if (need_telemetry)      gauge_ui_update_telemetry(&t);
                 if (g_mileage_dirty)   { g_mileage_dirty = false; gauge_ui_update_mileage(g_total_mi, g_trip_mi); }
-                if (g_energy_dirty)    { g_energy_dirty  = false; gauge_ui_update_energy(g_trip_wh, g_trip_mi, g_charge_wh, g_charge_mi); }
+                if (g_energy_dirty)    {
+                    g_energy_dirty = false;
+                    double rwh, rmi;
+                    roll_window(&rwh, &rmi);
+                    gauge_ui_update_energy(g_trip_wh, g_trip_mi,
+                                           g_charge_wh, g_charge_mi, rwh, rmi);
+                }
                 if (g_blink_dirty)     { g_blink_dirty   = false; gauge_ui_blink_tick(); }
                 bsp_display_unlock();
             }
@@ -446,6 +564,7 @@ static void telemetry_task(void *arg)
             g_trip_mi = 0.0;
             g_trip_wh = 0.0;
             g_trip_moving_s = 0.0;
+            roll_reset();           /* M is trip-based, so it resets with the trip */
             g_mileage_dirty = true;
             g_energy_dirty  = true;
             ESP_LOGI(TAG, "TRIP RESET");
@@ -466,11 +585,27 @@ static void telemetry_task(void *arg)
             ESP_LOGI(TAG, "Brightness: %d%% -> %d%% (err=%d)", prev, g_brightness, err);
         }
 
-        if (g_play_sound && !s_sound_playing) {
-            g_play_sound = false;
-            s_sound_playing = true;
-            xTaskCreate(boot_sound_task, "snd", 32768,
-                        (void *)(uintptr_t)g_sound_volume_req, 3, NULL);
+        /* Sound dispatcher. A fault alarm must not be swallowed by a jingle that
+         * happens to be playing — the boot clip is a ~10 minute song, so the old
+         * "drop it if busy" rule meant an over-temp could go unheard entirely. */
+        if (g_sound_req != SND_NONE) {
+            if (!s_sound_playing) {
+                sound_id_t id = g_sound_req;
+                g_sound_req     = SND_NONE;
+                s_sound_current = id;
+                s_sound_playing = true;
+                uint32_t arg = ((uint32_t)id << 8) | g_sound_volume_req;
+                xTaskCreate(sound_task, "snd", 32768,
+                            (void *)(uintptr_t)arg, 3, NULL);
+            } else if (g_sound_req == SND_ERROR && s_sound_current != SND_ERROR) {
+                /* Preempt: cut the current sound short. The request stays pending
+                 * and starts on a later pass, once that task has exited. */
+                sound_request_stop();
+            } else {
+                /* Can't preempt (a chime while something plays, or an alarm over
+                 * an alarm) — drop it rather than queue a sound that fires late. */
+                g_sound_req = SND_NONE;
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -522,9 +657,19 @@ static void button_task(void *arg)
     }
 }
 
-static void boot_sound_task(void *arg)
+/* arg packs the sound id and volume: (id << 8) | volume. The 32 kB stack is sized
+ * for the MP3 decoder (mp3dec_t alone is ~6.5 kB); the tone path needs far less
+ * but shares the task rather than duplicating it. */
+static void sound_task(void *arg)
 {
-    boot_sound_play((uint8_t)(uintptr_t)arg);
+    uint32_t   a   = (uint32_t)(uintptr_t)arg;
+    sound_id_t id  = (sound_id_t)(a >> 8);
+    uint8_t    vol = (uint8_t)(a & 0xFF);
+
+    if (id == SND_ERROR) alert_sound_play(vol);
+    else                 boot_sound_play(vol);
+
+    s_sound_current = SND_NONE;
     s_sound_playing = false;
     vTaskDelete(NULL);
 }
@@ -553,6 +698,9 @@ void app_main(void)
     load_mileage();
     g_mi_last_save   = g_total_mi;
     g_mi_last_update = g_total_mi;
+    /* Anchor the rolling window at the restored trip point — the ring itself
+     * isn't persisted, so M measures from here until it refills. */
+    roll_reset();
 
     /* Display + LVGL */
     bsp_display_cfg_t cfg = {
@@ -568,7 +716,12 @@ void app_main(void)
     bsp_display_lock(-1);
     gauge_ui_init(lv_screen_active());
     gauge_ui_update_mileage(g_total_mi, g_trip_mi);
-    gauge_ui_update_energy(g_trip_wh, g_trip_mi, g_charge_wh, g_charge_mi);
+    {
+        double rwh, rmi;
+        roll_window(&rwh, &rmi);
+        gauge_ui_update_energy(g_trip_wh, g_trip_mi,
+                               g_charge_wh, g_charge_mi, rwh, rmi);
+    }
     gauge_ui_set_trip_cb(on_trip_reset);
     gauge_ui_set_sound_cb(on_play_sound);
     gauge_ui_set_alert_sound_cb(on_alert_sound);

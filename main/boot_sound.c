@@ -1,6 +1,9 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 
+#include <math.h>
+#include <string.h>
+
 #include "boot_sound.h"
 #include "boot_sound_data.h"
 #include "bsp/esp32_p4_wifi6_touch_lcd_xc.h"
@@ -10,8 +13,122 @@
 
 static const char *TAG = "boot_sound";
 
+/* Set by sound_request_stop(), polled by the playback loops so a fault alarm can
+ * cut the boot jingle short instead of waiting ~10 minutes for a song to finish.
+ * Cleared at the start of each play, so a stale request can't kill the next sound. */
+static volatile bool s_stop_req = false;
+
+void sound_request_stop(void)
+{
+    s_stop_req = true;
+}
+
+/* ── Fault alarm — synthesised, no MP3 asset ─────────────────────────────────
+ * A two-tone alternating alarm. Deliberately harsh and periodic so it reads as a
+ * fault, not a notification. Retune by editing these five numbers. */
+#define ALERT_SR         22050   /* Hz — matches the BSP's own default I2S rate */
+#define ALERT_HI_HZ      1200.0f
+#define ALERT_LO_HZ       800.0f
+#define ALERT_TONE_MS     160    /* length of each tone in the pair            */
+#define ALERT_CYCLES        3    /* hi/lo pairs per alarm                      */
+#define ALERT_GAP_MS       70    /* silence between pairs                      */
+#define ALERT_AMPLITUDE 26000.0f /* of 32767; leaves headroom to avoid clipping */
+
+#define ALERT_CHUNK       256    /* samples per codec write                    */
+static int16_t s_alert_buf[ALERT_CHUNK];
+
+/* Emit one tone. A short linear fade in/out kills the click you'd otherwise get
+ * from starting and ending a sine mid-cycle at full amplitude. */
+static void alert_tone(esp_codec_dev_handle_t spk, float freq, int ms)
+{
+    const int total  = ALERT_SR * ms / 1000;
+    const int fade   = ALERT_SR / 200;          /* 5 ms */
+    const float dphi = 2.0f * (float)M_PI * freq / (float)ALERT_SR;
+    float phi = 0.0f;
+
+    for (int done = 0; done < total && !s_stop_req; ) {
+        int n = total - done;
+        if (n > ALERT_CHUNK) n = ALERT_CHUNK;
+
+        for (int i = 0; i < n; i++) {
+            const int idx = done + i;
+            float env = 1.0f;
+            if (idx < fade)                 env = (float)idx / (float)fade;
+            else if (idx > total - fade)    env = (float)(total - idx) / (float)fade;
+            if (env < 0.0f) env = 0.0f;
+
+            s_alert_buf[i] = (int16_t)(sinf(phi) * ALERT_AMPLITUDE * env);
+            phi += dphi;
+            if (phi > 2.0f * (float)M_PI) phi -= 2.0f * (float)M_PI;
+        }
+        esp_codec_dev_write(spk, s_alert_buf, n * (int)sizeof(int16_t));
+        done += n;
+    }
+}
+
+static void alert_silence(esp_codec_dev_handle_t spk, int ms)
+{
+    int total = ALERT_SR * ms / 1000;
+    memset(s_alert_buf, 0, sizeof(s_alert_buf));
+    for (int done = 0; done < total && !s_stop_req; ) {
+        int n = total - done;
+        if (n > ALERT_CHUNK) n = ALERT_CHUNK;
+        esp_codec_dev_write(spk, s_alert_buf, n * (int)sizeof(int16_t));
+        done += n;
+    }
+}
+
+esp_err_t alert_sound_play(uint8_t volume)
+{
+    s_stop_req = false;
+
+    /* bsp_audio_init() is a no-op once audio is up (it returns early without
+     * re-applying the config), so the format we actually get is whatever
+     * esp_codec_dev_open() below reconfigures the I2S clock/slot to. */
+    i2s_std_config_t i2s_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(ALERT_SR),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                       I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S_MCLK,
+            .bclk = BSP_I2S_SCLK,
+            .ws   = BSP_I2S_LCLK,
+            .dout = BSP_I2S_DOUT,
+            .din  = BSP_I2S_DSIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    ESP_ERROR_CHECK(bsp_audio_init(&i2s_cfg));
+
+    esp_codec_dev_handle_t spk = bsp_audio_codec_speaker_init();
+    if (spk == NULL) {
+        ESP_LOGE(TAG, "Speaker init failed");
+        return ESP_FAIL;
+    }
+
+    esp_codec_dev_sample_info_t fs = {
+        .sample_rate     = ALERT_SR,
+        .channel         = 1,
+        .bits_per_sample = 16,
+    };
+    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(spk, volume));
+    ESP_ERROR_CHECK(esp_codec_dev_open(spk, &fs));
+
+    for (int c = 0; c < ALERT_CYCLES && !s_stop_req; c++) {
+        alert_tone(spk, ALERT_HI_HZ, ALERT_TONE_MS);
+        alert_tone(spk, ALERT_LO_HZ, ALERT_TONE_MS);
+        if (c < ALERT_CYCLES - 1) alert_silence(spk, ALERT_GAP_MS);
+    }
+
+    esp_codec_dev_close(spk);
+    ESP_LOGI(TAG, "Alert tone complete%s", s_stop_req ? " (stopped early)" : "");
+    return ESP_OK;
+}
+
 esp_err_t boot_sound_play(uint8_t volume)
 {
+    s_stop_req = false;
+
     /* Peek at the first valid frame to learn sample-rate and channel count
      * before initialising I2S so the clock is correct. */
     /* Keep these in BSS, not on the stack — mp3dec_t alone is ~6.5 KB and
@@ -86,8 +203,10 @@ esp_err_t boot_sound_play(uint8_t volume)
                             first_samples * info.channels * sizeof(int16_t));
     }
 
-    /* Decode and stream the rest. */
-    while (remaining > 0) {
+    /* Decode and stream the rest. Bail out on a stop request — without this, a
+     * fault alarm raised during the boot jingle would have to wait out the whole
+     * song before it could be heard. */
+    while (remaining > 0 && !s_stop_req) {
         int samples = mp3dec_decode_frame(&dec, ptr, remaining, pcm, &info);
         if (info.frame_bytes == 0) break;
         ptr       += info.frame_bytes;
@@ -99,6 +218,6 @@ esp_err_t boot_sound_play(uint8_t volume)
     }
 
     esp_codec_dev_close(spk);
-    ESP_LOGI(TAG, "Playback complete");
+    ESP_LOGI(TAG, "Playback complete%s", s_stop_req ? " (stopped early)" : "");
     return ESP_OK;
 }
