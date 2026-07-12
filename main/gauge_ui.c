@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "esp_log.h"
 #include "gauge_ui.h"
 #include "triumph_logo.h"
@@ -21,6 +22,7 @@ LV_FONT_DECLARE(lv_font_montserrat_bold_44)
 
 #define SCALE_DIAM       760   /* nearly full display                   */
 #define NEEDLE_LEN       320   /* centre → tip, px                      */
+#define NEEDLE_WIDTH      12   /* stroke thickness, px                  */
 #define TICK_MINOR_LEN   13
 #define TICK_MAJOR_LEN   22
 
@@ -33,6 +35,10 @@ LV_FONT_DECLARE(lv_font_montserrat_bold_44)
 #define WARN_ROW_H       50    /* vertical gap between label rows       */
 
 #define ODO_Y            680
+/* Car-mode readout, just below the ODO/TRP plaque (which spans y 620..740).
+ * Kept outside the plaque so it doesn't enlarge the trip-reset tap target.
+ * The gauge sweep leaves a 60 deg gap at 6 o'clock, so this area is clear. */
+#define MODE_Y           760
 
 /* Colours */
 #define COL_RED     lv_color_hex(0xFF0000)
@@ -67,6 +73,8 @@ static lv_obj_t *g_temp_val_lbl;
 static lv_obj_t *g_temp_src_lbl;
 static lv_obj_t *g_odo_lbl;
 static lv_obj_t *g_odo_bg;
+static lv_obj_t *g_mode_lbl;
+static lv_obj_t *g_whmi_lbl;
 
 /* Trip reset callback */
 static void (*s_trip_cb)(void) = NULL;
@@ -93,6 +101,38 @@ static void hub_click_cb(lv_event_t *e)
 {
     ESP_LOGI("gauge_ui", "Hub dot pressed");
     if (s_brightness_cb) s_brightness_cb();
+}
+
+/* Wh/mile readout — cached trip & charge values plus which one is shown.
+ * Tapping the readout toggles between them; the value is prefixed 'T' or 'C'. */
+static double s_whmi_trip_wh = 0.0, s_whmi_trip_mi = 0.0;
+static double s_whmi_chg_wh  = 0.0, s_whmi_chg_mi  = 0.0;
+static bool   s_whmi_show_charge = false;
+
+static void whmi_render(void)
+{
+    char buf[24];
+    double wh  = s_whmi_show_charge ? s_whmi_chg_wh : s_whmi_trip_wh;
+    double mi  = s_whmi_show_charge ? s_whmi_chg_mi : s_whmi_trip_mi;
+    char   tag = s_whmi_show_charge ? 'C' : 'T';
+    int    whmi = 0;
+    /* Below ~0.1 mi the ratio is noise-dominated, so hold at 0. fabs() makes the
+     * reading polarity-independent (the IVT counter's sign depends on wiring). */
+    if (mi >= 0.1) {
+        double v = fabs(wh) / mi;
+        if (v > 999.0) v = 999.0;   /* keep it to 3 digits */
+        whmi = (int)(v + 0.5);
+    }
+    snprintf(buf, sizeof(buf), "%c %d\nWh/mi", tag, whmi);
+    lv_label_set_text(g_whmi_lbl, buf);
+}
+
+/* Runs in LVGL task context (under the display lock), so updating the label
+ * directly here is safe — no flag/hand-off needed. */
+static void whmi_click_cb(lv_event_t *e)
+{
+    s_whmi_show_charge = !s_whmi_show_charge;
+    whmi_render();
 }
 
 /* Alert blink state */
@@ -156,6 +196,21 @@ static lv_obj_t *centred_label(lv_obj_t *parent, int cx, int cy,
 /* Create a label with a fixed pixel width and centred text alignment.
  * Position is derived from the font's known line_height so lv_obj_update_layout
  * is never needed at update time — lv_label_set_text() alone is sufficient. */
+/* Car opmode → display text + colour. Values outside the known set are already
+ * rejected by telemetry_valid(), so the default is a defensive fallback only. */
+static const char *mode_text(uint8_t opmode, lv_color_t *col)
+{
+    switch ((car_mode_t)opmode) {
+        case CAR_MODE_RUN:       *col = COL_GREEN;  return "RUN";
+        case CAR_MODE_CHARGE:    *col = COL_GREEN;  return "CHARGING";
+        case CAR_MODE_PRECHARGE: *col = COL_YELLOW; return "PRECHARGE";
+        case CAR_MODE_PREHEAT:   *col = COL_YELLOW; return "PREHEAT";
+        case CAR_MODE_PCHFAIL:   *col = COL_RED;    return "PCH FAIL";
+        case CAR_MODE_OFF:       *col = COL_WHITE;  return "OFF";
+        default:                 *col = COL_WHITE;  return "---";
+    }
+}
+
 static lv_obj_t *fixed_label(lv_obj_t *parent, int cx, int cy, int w, int lines,
                                const char *txt, lv_color_t col, const lv_font_t *font)
 {
@@ -221,7 +276,7 @@ void gauge_ui_init(lv_obj_t *parent)
     /* Needle line (child of scale) */
     lv_style_init(&s_needle_line);
     lv_style_set_line_color(&s_needle_line, COL_RED);
-    lv_style_set_line_width(&s_needle_line, 5);
+    lv_style_set_line_width(&s_needle_line, NEEDLE_WIDTH);
     lv_style_set_line_rounded(&s_needle_line, true);
 
     g_needle = lv_line_create(g_scale);
@@ -258,6 +313,14 @@ void gauge_ui_init(lv_obj_t *parent)
     g_udc_lbl      = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H,     150, 1,
                                  "---",  COL_RED, df);
 
+    /* Efficiency (Wh/mile) — under the SOC block, in the gap above the ODO
+     * plaque. Two lines: the tag+3-digit value ("T 250") over a "Wh/mi" unit
+     * label. Tappable to toggle between the Trip and Charge meters. */
+    g_whmi_lbl = fixed_label(parent, SOC_X, WARN_Y + WARN_ROW_H * 3, 200, 2,
+                             "T 0\nWh/mi", COL_WHITE, &lv_font_montserrat_bold_36);
+    lv_obj_add_flag(g_whmi_lbl, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_whmi_lbl, whmi_click_cb, LV_EVENT_CLICKED, NULL);
+
     /* Right column: worst-temp value and source (hidden until warning) */
     g_temp_val_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H * 2, 150, 1,
                                  "20C", COL_RED, df);
@@ -281,6 +344,10 @@ void gauge_ui_init(lv_obj_t *parent)
 
     g_odo_lbl = fixed_label(parent, CX, ODO_Y, 280, 2,
                             "ODO: 0\nTRP: 0.0", COL_RED, &lv_font_montserrat_bold_36);
+
+    /* Car mode (Off / Run / Charging / …) directly under the TRP line */
+    g_mode_lbl = fixed_label(parent, CX, MODE_Y, 280, 1,
+                             "---", COL_WHITE, &lv_font_montserrat_bold_28);
 }
 
 /* ─── gauge_ui_update_telemetry ─────────────────────────────────────────── */
@@ -302,12 +369,22 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
     snprintf(buf, sizeof(buf), "%d%%", (int)t->soc_pct);
     lv_label_set_text(g_soc_pct_lbl, buf);
 
+    /* Car mode label */
+    lv_color_t mode_col;
+    const char *mode_txt = mode_text(t->opmode, &mode_col);
+    lv_label_set_text(g_mode_lbl, mode_txt);
+    lv_obj_set_style_text_color(g_mode_lbl, mode_col, 0);
+
     /* Battery temperature label */
     snprintf(buf, sizeof(buf), "%dC", (int)t->temp_bat_c);
     lv_label_set_text(g_bat_temp_lbl, buf);
 
-    /* SOC indicator: worst of SOC% and bus voltage */
-    int soc_sev = (t->soc_pct < SOC_ALERT_PCT) ? 2
+    /* SOC indicator: worst of SOC% and bus voltage.
+     * SOC is only meaningful while the car is in Run — ignore it otherwise
+     * so a stale/idle reading doesn't nuisance-trigger the warning. */
+    bool in_run = (t->opmode == CAR_MODE_RUN);
+    int soc_sev = (!in_run) ? 0
+                : (t->soc_pct < SOC_ALERT_PCT) ? 2
                 : (t->soc_pct < SOC_WARN_PCT)  ? 1 : 0;
     int udc_sev = severity(t->udc_v, &TH_UDC);
     int combined = soc_sev > udc_sev ? soc_sev : udc_sev;
@@ -391,6 +468,16 @@ void gauge_ui_update_mileage(double total_miles, double trip_miles)
     if (trip_dec < 0) trip_dec = -trip_dec;
     snprintf(buf, sizeof(buf), "ODO: %d\nTRP: %d.%d", (int)total_miles, trip_int, trip_dec);
     lv_label_set_text(g_odo_lbl, buf);
+}
+
+/* ─── gauge_ui_update_energy ────────────────────────────────────────────── */
+
+void gauge_ui_update_energy(double trip_wh, double trip_miles,
+                            double charge_wh, double charge_miles)
+{
+    s_whmi_trip_wh = trip_wh;   s_whmi_trip_mi = trip_miles;
+    s_whmi_chg_wh  = charge_wh; s_whmi_chg_mi  = charge_miles;
+    whmi_render();   /* honours the current trip/charge toggle */
 }
 
 /* ─── gauge_ui_set_trip_cb ───────────────────────────────────────────────── */
