@@ -12,6 +12,15 @@ CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+
+# Task watchdog must REBOOT on a hang, not just print. The telemetry slave shares
+# the I2C bus with the touch panel, so a wedged bus can block the touch read
+# inside the LVGL task while it holds the display lock — the screen freezes and
+# nothing recovers it. Without PANIC the watchdog only logs and the dash stays
+# dead. A 5 s auto-reboot is far better than a permanently blank gauge.
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=5
+
 CONFIG_FREERTOS_HZ=1000
 CONFIG_FREERTOS_VTASKLIST_INCLUDE_COREID=y
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y

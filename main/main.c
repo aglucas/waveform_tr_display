@@ -7,6 +7,8 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_system.h"
+#include "esp_task_wdt.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/gpio.h"
@@ -200,10 +202,115 @@ static void on_alert_sound(void)      { g_sound_volume_req = 100;          g_sou
 static void on_brightness_step(void)  { g_brightness_dirty = true; }
 static void sound_task(void *arg);
 
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  Task watchdog                                                               */
+/*                                                                              */
+/*  CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0/1 only watches the IDLE tasks, so  */
+/*  the watchdog never fired on the lockups: when the LVGL task blocks inside    */
+/*  the touch driver on a wedged I2C bus, it blocks — it does not spin — so idle */
+/*  keeps running and happily feeds the watchdog while the screen is frozen.     */
+/*                                                                              */
+/*  Subscribing the two tasks that can actually stall makes a hang observable:   */
+/*    - LVGL task: holds the display lock and reads the GT911 over the SHARED    */
+/*      I2C bus. This is the one that freezes the UI.                            */
+/*    - telemetry_task: drives LVGL, writes odometer.bin through FATFS.          */
+/*  With CONFIG_ESP_TASK_WDT_PANIC=y, either one stalling >5 s now panics and     */
+/*  reboots instead of leaving a dead dash.                                      */
+/*                                                                              */
+/*  Deliberately NOT subscribed: the sound task (legitimately blocks for minutes */
+/*  streaming the MP3) and the timer service.                                    */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+#define LVGL_WDT_FEED_MS  1000   /* well under CONFIG_ESP_TASK_WDT_TIMEOUT_S (5 s) */
+
+/* lv_timer callbacks are dispatched from inside lv_timer_handler(), i.e. in the
+ * LVGL task's own context — so esp_task_wdt_add(NULL) here subscribes THAT task,
+ * without needing the BSP/adapter to expose its handle. It must also be the thing
+ * that feeds it: esp_task_wdt_reset() only ever resets the CALLING task's entry,
+ * so subscribing the LVGL task from anywhere else would just trip the watchdog. */
+static void lvgl_wdt_cb(lv_timer_t *timer)
+{
+    static bool subscribed = false;
+
+    if (!subscribed) {
+        esp_err_t err = esp_task_wdt_add(NULL);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "LVGL task TWDT subscribe failed: %s", esp_err_to_name(err));
+            return;   /* don't reset an entry we don't own */
+        }
+        subscribed = true;
+        ESP_LOGI(TAG, "LVGL task subscribed to TWDT (feeding every %d ms)", LVGL_WDT_FEED_MS);
+    }
+
+    esp_task_wdt_reset();
+}
+
 /* ── Button GPIOs (adjust to match your hardware wiring) ──────────────────── */
 #define BTN_UP   GPIO_NUM_32 // 40 pin header pin 26
 
 /* ── Timing ───────────────────────────────────────────────────────────────── */
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  Boot / reset-reason log                                                     */
+/*                                                                              */
+/*  The dash lives in a car with no serial monitor attached, so a lockup or a   */
+/*  spontaneous reboot otherwise leaves no trace at all. Append the reset reason */
+/*  to the SD card every boot: TASK_WDT means a task hung (most likely blocked   */
+/*  on a wedged I2C bus), PANIC means a crash or stack overflow, BROWNOUT means  */
+/*  the supply dipped. That one word tells us which failure we're chasing.       */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+#define BOOTLOG_FILE  BSP_SD_MOUNT_POINT "/bootlog.txt"
+#define BOOT_NS       "boot"
+#define KEY_BOOTCNT   "count"
+
+static const char *reset_reason_str(esp_reset_reason_t r)
+{
+    switch (r) {
+        case ESP_RST_POWERON:   return "POWERON";    /* normal cold start        */
+        case ESP_RST_EXT:       return "EXT";        /* external reset pin       */
+        case ESP_RST_SW:        return "SW";         /* esp_restart()            */
+        case ESP_RST_PANIC:     return "PANIC";      /* crash / stack overflow   */
+        case ESP_RST_INT_WDT:   return "INT_WDT";    /* interrupts blocked       */
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";   /* a task hung  <-- lockup  */
+        case ESP_RST_WDT:       return "OTHER_WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";   /* supply dipped            */
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
+
+static void log_boot_reason(void)
+{
+    esp_reset_reason_t r = esp_reset_reason();
+    const char *why = reset_reason_str(r);
+
+    /* Boot counter in NVS — boots are rare, so the flash wear is negligible, and
+     * it makes the SD log readable at a glance ("we're on boot 37"). */
+    uint32_t n = 0;
+    nvs_handle_t h;
+    if (nvs_open(BOOT_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_get_u32(h, KEY_BOOTCNT, &n);
+        n++;
+        nvs_set_u32(h, KEY_BOOTCNT, n);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    /* An unexpected reason is the interesting case — shout about it. */
+    if (r == ESP_RST_POWERON || r == ESP_RST_EXT || r == ESP_RST_SW)
+        ESP_LOGI(TAG, "Boot #%lu, reset reason: %s", (unsigned long)n, why);
+    else
+        ESP_LOGE(TAG, "Boot #%lu after an ABNORMAL reset: %s", (unsigned long)n, why);
+
+    if (!s_sd_mounted) return;
+    FILE *fp = fopen(BOOTLOG_FILE, "a");
+    if (!fp) {
+        ESP_LOGW(TAG, "bootlog: could not open %s", BOOTLOG_FILE);
+        return;
+    }
+    fprintf(fp, "boot %lu  reset=%s\n", (unsigned long)n, why);
+    fclose(fp);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /*  Mileage persistence — SD card primary, NVS fallback                        */
@@ -444,7 +551,15 @@ static void telemetry_task(void *arg)
     TickType_t last_ui = 0;
     float prev_speed = 0.0f;
 
+    /* Watched by the TWDT — this task must complete a loop within the 5 s
+     * timeout. It never blocks unboundedly: bsp_display_lock() has a 500 ms
+     * timeout and i2c_rx_get() is non-blocking, so the only long pole is the
+     * FATFS write in save_mileage(). */
+    ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
+
     while (1) {
+        esp_task_wdt_reset();
+
         bool need_telemetry = false;
         if (i2c_rx_get(&t)) {
             float new_speed = (t.speed_mph < 0) ? 0 :
@@ -695,6 +810,10 @@ void app_main(void)
         ESP_LOGW(TAG, "SD card not available — using NVS");
     }
 
+    /* Straight after the mount, before anything else can crash — this is the only
+     * record of WHY we restarted when no serial monitor is attached. */
+    log_boot_reason();
+
     load_mileage();
     g_mi_last_save   = g_total_mi;
     g_mi_last_update = g_total_mi;
@@ -726,6 +845,12 @@ void app_main(void)
     gauge_ui_set_sound_cb(on_play_sound);
     gauge_ui_set_alert_sound_cb(on_alert_sound);
     gauge_ui_set_brightness_cb(on_brightness_step);
+
+    /* Runs in the LVGL task, so it both subscribes that task to the TWDT and
+     * feeds it. If the touch read ever blocks on a wedged I2C bus, this timer
+     * stops firing and the watchdog reboots us instead of leaving a dead dash. */
+    lv_timer_create(lvgl_wdt_cb, LVGL_WDT_FEED_MS, NULL);
+
     bsp_display_unlock();
 
     /* ESP-NOW receiver (also inits WiFi + NVS event loop) */
@@ -740,7 +865,10 @@ void app_main(void)
     xTimerStart(t_blink, 0);
 
     /* Tasks */
-    xTaskCreate(telemetry_task, "telemetry", 4096, NULL, 5, NULL);
+    /* 8192, not 4096: this task drives LVGL, writes odometer.bin through FATFS,
+     * and calls log_counters() — whose %f conversions burn ~1-1.5 kB on their own
+     * under newlib's full (non-nano) float formatting. 4 kB was too tight. */
+    xTaskCreate(telemetry_task, "telemetry", 8192, NULL, 5, NULL);
     /* 4096, not 2048: this task calls save_mileage_fast() -> log_counters(), and
      * newlib's full (non-nano) float formatting burns ~1-1.5 kB of stack on the
      * %f conversions alone, on top of fopen/fwrite. */
