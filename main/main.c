@@ -15,7 +15,7 @@
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 #include "gauge_ui.h"
-#include "i2c_rx.h"
+#include "rs485_rx.h"
 #include "boot_sound.h"
 
 static const char *TAG = "speedometer";
@@ -130,7 +130,10 @@ static bool   s_was_bus_live = false;   /* tracks the Run/Charge -> off edge */
  * refills. Persisting the ring would mean carrying it in odometer.bin. */
 #define ROLL_WINDOW_MI  10.0
 #define ROLL_BUCKET_MI  0.1
-#define ROLL_N          ((int)(ROLL_WINDOW_MI / ROLL_BUCKET_MI) + 1)   /* 101 */
+/* = ROLL_WINDOW_MI / ROLL_BUCKET_MI + 1. Spelled as a literal because a float
+ * division is not an integer constant expression in C — using it as an array
+ * size makes g_roll a VLA at file scope ("variably modified" warning). */
+#define ROLL_N          101
 
 typedef struct { double mi, wh; } roll_sample_t;
 static roll_sample_t g_roll[ROLL_N];
@@ -553,7 +556,7 @@ static void telemetry_task(void *arg)
 
     /* Watched by the TWDT — this task must complete a loop within the 5 s
      * timeout. It never blocks unboundedly: bsp_display_lock() has a 500 ms
-     * timeout and i2c_rx_get() is non-blocking, so the only long pole is the
+     * timeout and rs485_rx_get() is non-blocking, so the only long pole is the
      * FATFS write in save_mileage(). */
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
@@ -561,7 +564,7 @@ static void telemetry_task(void *arg)
         esp_task_wdt_reset();
 
         bool need_telemetry = false;
-        if (i2c_rx_get(&t)) {
+        if (rs485_rx_get(&t)) {
             float new_speed = (t.speed_mph < 0) ? 0 :
                               (t.speed_mph > 100) ? 100 : t.speed_mph;
 
@@ -853,8 +856,9 @@ void app_main(void)
 
     bsp_display_unlock();
 
-    /* ESP-NOW receiver (also inits WiFi + NVS event loop) */
-    ESP_ERROR_CHECK(i2c_rx_init());
+    /* RS-485 telemetry receiver — dedicated UART, so a telemetry fault can
+     * never touch the I2C bus the touch controller lives on. */
+    ESP_ERROR_CHECK(rs485_rx_init());
 
     /* Periodic timers */
     TimerHandle_t t_mile = xTimerCreate("mile", pdMS_TO_TICKS(MILEAGE_TICK_MS),

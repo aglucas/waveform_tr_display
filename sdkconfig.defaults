@@ -1,5 +1,6 @@
 CONFIG_IDF_TARGET="esp32p4"
-CONFIG_ESP_HOST_WIFI_ENABLED=y
+# (CONFIG_ESP_HOST_WIFI_ENABLED removed — it only existed for the never-built
+# ESP-NOW receiver. Telemetry arrives over RS-485; no WiFi stack on this board.)
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_1=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y

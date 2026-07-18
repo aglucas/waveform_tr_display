@@ -1,6 +1,6 @@
 #pragma once
 #include "lvgl.h"
-#include "i2c_rx.h"
+#include "rs485_rx.h"
 
 /* Build all gauge widgets on `parent` (pass lv_screen_active()). */
 void gauge_ui_init(lv_obj_t *parent);
