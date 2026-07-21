@@ -23,7 +23,7 @@ typedef enum {
  *   - TelemetryPacket in speed_test_driver/main/main.cpp
  *   - this struct
  *   - telemetry_t in waveform_power_display/main/rs485_rx.h
- * (9 × float + 2 bytes = 38 bytes) */
+ * (10 × float + 2 bytes = 42 bytes) */
 typedef struct __attribute__((packed)) {
     float speed_mph;
     float temp_bat_c;
@@ -34,6 +34,7 @@ typedef struct __attribute__((packed)) {
     float udc_v;
     float energy_wh;     /* cumulative energy counter, Wh (signed; ZombieVerter KWh spot value ×1000) */
     float power_kw;      /* DC bus power, kW; regen is negative (used by the power display) */
+    float uaux_v;        /* 12V aux battery voltage, polled infrequently by the sender */
     uint8_t opmode;      /* car_mode_t — Off / Run / Precharge / PchFail / Charge / Preheat */
     uint8_t ready;       /* set to TELEMETRY_READY_MAGIC by sender when data is valid */
 } telemetry_t;
