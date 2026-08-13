@@ -15,11 +15,11 @@
  * wire can corrupt a frame (which the CRC rejects) but can never wedge a bus,
  * block the touch read, or freeze the UI.
  *
- * Receive-only: the transceiver's DE is tied low (10k pulldown), so this node
- * physically cannot drive the pair. If the sender is off, the fail-safe
- * receiver idles the line and no frames arrive — telemetry_task's staleness
- * guard (SPEED_STALE_MS) then freezes the odometer rather than integrating a
- * stale speed.
+ * Receive-only: the transceiver's combined DE/RE line is held low by this
+ * driver at init and never toggled, so this node physically cannot drive the
+ * pair. If the sender is off, the fail-safe receiver idles the line and no
+ * frames arrive — telemetry_task's staleness guard (SPEED_STALE_MS) then
+ * freezes the odometer rather than integrating a stale speed.
  *
  * Frame format (must match speed_test_driver/main/main.cpp):
  *     [0xAA][0x55][ telemetry_t payload ][CRC8 over payload]
@@ -29,11 +29,18 @@
 #define RS485_UART        UART_NUM_1
 #define RS485_BAUD        115200     /* must match the sender */
 
-/* PLACEHOLDER — set to the 40-pin-header GPIO wired to the transceiver's RO
- * before flashing. Must be free of BSP assignments (I2C=7/8, I2S=9-13,
- * LCD=23/26/27, SD=39-44, amp=53) and of BTN_UP (GPIO32 in main.c). Any
- * input-capable pin works — the UART routes through the GPIO matrix. */
-#define RS485_RX_PIN      GPIO_NUM_33
+/* Wired to the transceiver's TXD (its UART output — the data it recovered off
+ * the RS-485 bus). NOTE: swapped from GPIO21 to GPIO20 — the module's TXD/RXD
+ * pins were originally straight-matched to the ESP32's RX/TX instead of
+ * crossed, which left this receiver listening to the module's input pin.
+ * GPIO21 is wired to the module's RXD (its UART input, unused in this
+ * receive-only build — nothing here needs to drive it). */
+#define RS485_RX_PIN      GPIO_NUM_20
+
+/* Combined DE/RE line. Held low permanently — never driven high, since this
+ * build has no TX path wired to the UART. Low disables the driver (DE) and
+ * enables the receiver output (RE), i.e. permanent receive mode. */
+#define RS485_DE_PIN      GPIO_NUM_2
 
 #define TELEM_SYNC0       0xAA
 #define TELEM_SYNC1       0x55
@@ -77,6 +84,7 @@ static bool telemetry_valid(const telemetry_t *t)
     /* Cumulative energy in Wh; ±100,000 kWh brackets any plausible counter value. */
     if (!isfinite(t->energy_wh)  || t->energy_wh  < -1e8f  || t->energy_wh  >  1e8f)   return false;
     if (!isfinite(t->power_kw)   || t->power_kw   < -300.0f || t->power_kw  >  300.0f) return false;
+    if (!isfinite(t->max_throttle_pct) || t->max_throttle_pct < 0.0f || t->max_throttle_pct > 100.0f) return false;
     if (t->opmode >= CAR_MODE_LAST) return false;
     return true;
 }
@@ -92,7 +100,7 @@ static void rx_task(void *arg)
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
     /* Log link health once a second, only while it's bad. */
-    uint32_t   ok_count = 0, rej_count = 0;
+    uint32_t   ok_count = 0, rej_count = 0, byte_count = 0;
     TickType_t last_report = xTaskGetTickCount();
 
     while (1) {
@@ -100,7 +108,7 @@ static void rx_task(void *arg)
 
         int n = uart_read_bytes(RS485_UART, acc + fill, RX_ACC_LEN - fill,
                                 pdMS_TO_TICKS(100));
-        if (n > 0) fill += n;
+        if (n > 0) { fill += n; byte_count += n; }
 
         /* Scan for complete frames; keep whatever tail remains for next pass. */
         int i = 0;
@@ -134,11 +142,13 @@ static void rx_task(void *arg)
 
         TickType_t now = xTaskGetTickCount();
         if (now - last_report >= pdMS_TO_TICKS(1000)) {
-            if (rej_count)
-                ESP_LOGW(TAG, "RS-485 rejects: %lu bad / %lu ok in last 1s (noise or baud mismatch?)",
-                         (unsigned long)rej_count, (unsigned long)ok_count);
+            if (byte_count == 0)
+                ESP_LOGW(TAG, "RS-485: no bytes received in last 1s (check wiring/power/baud)");
+            else if (rej_count)
+                ESP_LOGW(TAG, "RS-485 rejects: %lu bad / %lu ok in last 1s, %lu bytes in (noise or baud mismatch?)",
+                         (unsigned long)rej_count, (unsigned long)ok_count, (unsigned long)byte_count);
             last_report = now;
-            ok_count = rej_count = 0;
+            ok_count = rej_count = byte_count = 0;
         }
     }
 }
@@ -147,6 +157,18 @@ esp_err_t rs485_rx_init(void)
 {
     s_queue = xQueueCreate(1, sizeof(telemetry_t));
     if (!s_queue) return ESP_ERR_NO_MEM;
+
+    /* Hold the transceiver in receive mode before the UART (and thus the
+     * sender's line) is live, so no window exists where DE/RE floats. */
+    gpio_config_t de_io = {
+        .pin_bit_mask = (1ULL << RS485_DE_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&de_io));
+    ESP_ERROR_CHECK(gpio_set_level(RS485_DE_PIN, 0));
 
     uart_config_t cfg = {
         .baud_rate  = RS485_BAUD,

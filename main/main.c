@@ -248,7 +248,7 @@ static void lvgl_wdt_cb(lv_timer_t *timer)
 }
 
 /* ── Button GPIOs (adjust to match your hardware wiring) ──────────────────── */
-#define BTN_UP   GPIO_NUM_32 // 40 pin header pin 26
+#define BTN_PFAIL   GPIO_NUM_32 // 40 pin header pin 26
 
 /* ── Timing ───────────────────────────────────────────────────────────────── */
 
@@ -745,7 +745,7 @@ static void IRAM_ATTR btn_isr(void *arg)
 static void button_task(void *arg)
 {
     gpio_config_t io = {
-        .pin_bit_mask = (1ULL << BTN_UP),
+        .pin_bit_mask = (1ULL << BTN_PFAIL),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -758,7 +758,7 @@ static void button_task(void *arg)
     if (r != ESP_OK && r != ESP_ERR_INVALID_STATE)
         ESP_ERROR_CHECK(r);
 
-    gpio_isr_handler_add(BTN_UP, btn_isr, xTaskGetCurrentTaskHandle());
+    gpio_isr_handler_add(BTN_PFAIL, btn_isr, xTaskGetCurrentTaskHandle());
 
     TickType_t last_trigger = xTaskGetTickCount() - pdMS_TO_TICKS(1000);
 
@@ -767,7 +767,7 @@ static void button_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10));              /* debounce */
 
         TickType_t now = xTaskGetTickCount();
-        if (gpio_get_level(BTN_UP) == 0 &&
+        if (gpio_get_level(BTN_PFAIL) == 0 &&
             (now - last_trigger) >= pdMS_TO_TICKS(1000)) {
             last_trigger = now;
             save_mileage_fast();   /* SD only — no NVS flash erase */
@@ -797,6 +797,13 @@ static void sound_task(void *arg)
 /* ═══════════════════════════════════════════════════════════════════════════ */
 void app_main(void)
 {
+    /* esp_codec_dev's I2S backend unconditionally disables the output channel
+     * on every esp_codec_dev_open() to safely reconfigure it, and ignores the
+     * result — so every play after the first (which closes and leaves the
+     * channel disabled) hits an already-disabled channel here. Harmless; the
+     * channel is re-enabled right after as part of the same open sequence. */
+    esp_log_level_set("i2s_common", ESP_LOG_NONE);
+
     /* NVS for mileage */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
