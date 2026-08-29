@@ -48,6 +48,12 @@ LV_FONT_DECLARE(lv_font_montserrat_bold_88)
 #define BIG_TITLE_Y      150
 #define BIG_VAL_Y        232
 
+/* 12V aux battery readout — the last slot in the SOC column before it runs
+ * into the ODO/TRP plaque (top edge at ODO_Y - 60 = 620), hence the small
+ * font: at line_height 28 the label's bottom edge (606 + 14 = 620) lands
+ * exactly on the plaque with no overlap. */
+#define AUX_Y            606
+
 #define ODO_Y            680
 /* Car-mode readout, just below the ODO/TRP plaque (which spans y 620..740).
  * Kept outside the plaque so it doesn't enlarge the trip-reset tap target.
@@ -90,6 +96,7 @@ static lv_obj_t *g_odo_lbl;
 static lv_obj_t *g_odo_bg;
 static lv_obj_t *g_mode_lbl;
 static lv_obj_t *g_whmi_lbl;
+static lv_obj_t *g_aux_lbl;
 static lv_obj_t *g_big_bg;
 static lv_obj_t *g_big_title;
 static lv_obj_t *g_big_val;
@@ -326,7 +333,7 @@ static const char *mode_text(uint8_t opmode, lv_color_t *col)
         case CAR_MODE_RUN:       *col = COL_GREEN;  return "RUN";
         case CAR_MODE_CHARGE:    *col = COL_GREEN;  return "CHARGING";
         case CAR_MODE_PRECHARGE: *col = COL_YELLOW; return "PRECHARGE";
-        case CAR_MODE_PREHEAT:   *col = COL_YELLOW; return "PREHEAT";
+        case CAR_MODE_PREHEAT:   *col = COL_YELLOW; return "12V Maint";
         case CAR_MODE_PCHFAIL:   *col = COL_RED;    return "PCH FAIL";
         case CAR_MODE_OFF:       *col = COL_WHITE;  return "OFF";
         default:                 *col = COL_WHITE;  return "---";
@@ -378,7 +385,7 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_style_set_line_color(&s_ticks_major, COL_RED);
     lv_style_set_line_width(&s_ticks_major, 3);
     lv_style_set_length(&s_ticks_major, TICK_MAJOR_LEN);
-    lv_style_set_text_color(&s_ticks_major, COL_RED);
+    lv_style_set_text_color(&s_ticks_major, COL_WHITE);
     lv_style_set_text_font(&s_ticks_major, &lv_font_montserrat_bold_44);
 
     /* Scale widget */
@@ -430,11 +437,11 @@ void gauge_ui_init(lv_obj_t *parent)
     /* Left column: bat temp, SOC %, DC bus V (above SOC circle, top→bottom)
      * Fixed-width labels — text updates need only lv_label_set_text(), no recentre. */
     g_bat_temp_lbl = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 3, 150, 1,
-                                 "20C",  COL_RED, df);
+                                 "20C",  COL_WHITE, df);
     g_soc_pct_lbl  = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H * 2, 150, 1,
-                                 "100%", COL_RED, df);
+                                 "100%", COL_WHITE, df);
     g_udc_lbl      = fixed_label(parent, SOC_X, WARN_Y - WARN_ROW_H,     150, 1,
-                                 "---",  COL_RED, df);
+                                 "---",  COL_WHITE, df);
 
     /* Each small value promotes itself into the large readout when tapped. */
     lv_obj_add_flag(g_bat_temp_lbl, LV_OBJ_FLAG_CLICKABLE);
@@ -451,6 +458,10 @@ void gauge_ui_init(lv_obj_t *parent)
                              "T 0\nWh/mi", COL_WHITE, &lv_font_montserrat_bold_36);
     lv_obj_add_flag(g_whmi_lbl, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(g_whmi_lbl, whmi_click_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 12V aux battery voltage — last readout in the SOC column */
+    g_aux_lbl = fixed_label(parent, SOC_X, AUX_Y, 150, 1,
+                            "--.-V", COL_WHITE, &lv_font_montserrat_bold_28);
 
     /* Right column: worst-temp value and source (hidden until warning) */
     g_temp_val_lbl = fixed_label(parent, TEMP_X, WARN_Y - WARN_ROW_H * 2, 150, 1,
@@ -474,7 +485,7 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_obj_add_event_cb(g_odo_bg, odo_click_cb, LV_EVENT_CLICKED, NULL);
 
     g_odo_lbl = fixed_label(parent, CX, ODO_Y, 280, 2,
-                            "ODO: 0\nTRP: 0.0", COL_RED, &lv_font_montserrat_bold_36);
+                            "ODO: 0\nTRP: 0.0", COL_WHITE, &lv_font_montserrat_bold_36);
 
     /* Car mode (Off / Run / Charging / …) directly under the TRP line */
     g_mode_lbl = fixed_label(parent, CX, MODE_Y, 280, 1,
@@ -496,7 +507,7 @@ void gauge_ui_init(lv_obj_t *parent)
     g_big_title = fixed_label(parent, CX, BIG_TITLE_Y, BIG_W - 20, 1,
                               "SOC", COL_WHITE, &lv_font_montserrat_bold_36);
     g_big_val   = fixed_label(parent, CX, BIG_VAL_Y,   BIG_W - 20, 1,
-                              "0", COL_RED, &lv_font_montserrat_bold_88);
+                              "0", COL_WHITE, &lv_font_montserrat_bold_88);
 
     /* The two labels are left non-clickable (the default), so LVGL's hit test
      * skips them and the tap lands on the plaque underneath — that's what makes
@@ -547,6 +558,10 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
     snprintf(buf, sizeof(buf), "%dC", (int)t->temp_bat_c);
     lv_label_set_text(g_bat_temp_lbl, buf);
 
+    /* 12V aux battery voltage */
+    snprintf(buf, sizeof(buf), "%.1fV", t->uaux_v);
+    lv_label_set_text(g_aux_lbl, buf);
+
     /* SOC indicator: worst of SOC% and bus voltage. Both are only meaningful
      * with the contactors closed (Run or Charge); outside that we're looking at
      * placeholders, so force severity to 0 rather than grading a made-up number.
@@ -575,7 +590,7 @@ void gauge_ui_update_telemetry(const telemetry_t *t)
     } else if (udc_sev == 1) {
         lv_obj_set_style_text_color(g_udc_lbl, COL_YELLOW, 0);
     } else {
-        lv_obj_set_style_text_color(g_udc_lbl, COL_RED, 0);
+        lv_obj_set_style_text_color(g_udc_lbl, COL_WHITE, 0);
     }
 
     /* Temperature: highest severity wins; BAT is default/preferred */
