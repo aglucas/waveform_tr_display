@@ -2,7 +2,9 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* Play the boot jingle (embedded MP3) via I2S/ES8311 at the given volume (0–100).
+/* Play the boot jingle via I2S/ES8311 at the given volume (0–100), streaming the
+ * MP3 from the SD card (see BOOT_SOUND_FILE in boot_sound.c) rather than flash.
+ * Returns ESP_ERR_NOT_FOUND if the card isn't mounted or the file is missing.
  * Blocks until playback is complete, or returns early if sound_request_stop()
  * is called. Safe to call once display initialisation is done. */
 esp_err_t boot_sound_play(uint8_t volume);

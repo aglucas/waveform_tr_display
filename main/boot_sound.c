@@ -3,15 +3,39 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "boot_sound.h"
-#include "boot_sound_data.h"
 #include "bsp/esp32_p4_wifi6_touch_lcd_xc.h"
 #include "esp_codec_dev.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 
 static const char *TAG = "boot_sound";
+
+/* Boot jingle streams from the SD card instead of living in flash — drop an MP3
+ * at this path to change it, no firmware rebuild required. */
+#define BOOT_SOUND_FILE      BSP_SD_MOUNT_POINT "/car_jam.mp3"
+
+/* Read buffer for streaming the MP3 off the card. Refilled once fewer than
+ * MP3_REFILL_MARGIN bytes remain — comfortably more than the largest possible
+ * MPEG frame (~2.9 KB), so mp3dec_decode_frame() is never starved mid-frame. */
+#define MP3_BUF_SIZE         (16 * 1024)
+#define MP3_REFILL_MARGIN    (8 * 1024)
+static uint8_t s_mp3_buf[MP3_BUF_SIZE];
+
+/* Slide any unconsumed bytes to the front of the buffer and top it back up from
+ * fp. Safe to call at EOF — fread() just returns 0 and remaining stops growing. */
+static void mp3_refill(FILE *fp, uint8_t **ptr, int *remaining)
+{
+    if (*remaining > 0 && *ptr != s_mp3_buf)
+        memmove(s_mp3_buf, *ptr, (size_t)*remaining);
+    *ptr = s_mp3_buf;
+
+    size_t space = MP3_BUF_SIZE - (size_t)*remaining;
+    size_t got   = fread(s_mp3_buf + *remaining, 1, space, fp);
+    *remaining += (int)got;
+}
 
 /* Set by sound_request_stop(), polled by the playback loops so a fault alarm can
  * cut the boot jingle short instead of waiting ~10 minutes for a song to finish.
@@ -129,6 +153,12 @@ esp_err_t boot_sound_play(uint8_t volume)
 {
     s_stop_req = false;
 
+    FILE *fp = fopen(BOOT_SOUND_FILE, "rb");
+    if (!fp) {
+        ESP_LOGW(TAG, "Boot jingle skipped — %s not found on SD card", BOOT_SOUND_FILE);
+        return ESP_ERR_NOT_FOUND;
+    }
+
     /* Peek at the first valid frame to learn sample-rate and channel count
      * before initialising I2S so the clock is correct. */
     /* Keep these in BSS, not on the stack — mp3dec_t alone is ~6.5 KB and
@@ -140,21 +170,41 @@ esp_err_t boot_sound_play(uint8_t volume)
 
     mp3dec_frame_info_t info = {0};
 
-    const uint8_t *ptr       = boot_sound_mp3;
-    int            remaining = (int)boot_sound_mp3_len;
+    uint8_t *ptr       = s_mp3_buf;
+    int      remaining = 0;
+    mp3_refill(fp, &ptr, &remaining);
 
-    /* Advance past ID3 tags / garbage until we find a real sync frame. */
+    /* Advance past ID3 tags / garbage until we find a real sync frame.
+     * mp3d_find_frame() reports "no frame" by consuming its entire input
+     * buffer, so a tag bigger than one refill (an embedded cover image in an
+     * ID3v2 header routinely runs to hundreds of KB, vs. MP3_BUF_SIZE's
+     * 16 KB) can drain `remaining` to exactly 0 and fail the while condition
+     * before the loop ever gets back around to refilling — wrongly reported
+     * as "no valid MP3 frame" on a perfectly good file. Refill right after
+     * that happens too, and only give up once a refill actually yields no
+     * new bytes (true EOF). */
     int first_samples = 0;
-    while (remaining > 0) {
+    for (;;) {
+        if (remaining < MP3_REFILL_MARGIN) {
+            int before = remaining;
+            mp3_refill(fp, &ptr, &remaining);
+            /* No new bytes AND nothing left buffered either — true EOF.
+             * (A refill can legitimately add 0 bytes while `remaining` stays
+             * positive, e.g. one last leftover chunk right at EOF — that
+             * still needs a decode attempt, so don't bail out on it here.) */
+            if (remaining == before && remaining == 0) break;
+        }
+        if (remaining <= 0) break;
         first_samples = mp3dec_decode_frame(&dec, ptr, remaining, pcm, &info);
-        if (info.frame_bytes == 0) break;
+        if (info.frame_bytes == 0) break;     /* decoder made zero progress */
         ptr       += info.frame_bytes;
         remaining -= info.frame_bytes;
-        if (first_samples > 0) break;
+        if (first_samples > 0) break;         /* found real audio */
     }
 
     if (info.hz == 0 || info.frame_bytes == 0) {
-        ESP_LOGE(TAG, "Could not find valid MP3 frame");
+        ESP_LOGE(TAG, "Could not find valid MP3 frame in %s", BOOT_SOUND_FILE);
+        fclose(fp);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -186,6 +236,7 @@ esp_err_t boot_sound_play(uint8_t volume)
     esp_codec_dev_handle_t spk = bsp_audio_codec_speaker_init();
     if (spk == NULL) {
         ESP_LOGE(TAG, "Speaker init failed");
+        fclose(fp);
         return ESP_FAIL;
     }
 
@@ -207,6 +258,7 @@ esp_err_t boot_sound_play(uint8_t volume)
      * fault alarm raised during the boot jingle would have to wait out the whole
      * song before it could be heard. */
     while (remaining > 0 && !s_stop_req) {
+        if (remaining < MP3_REFILL_MARGIN) mp3_refill(fp, &ptr, &remaining);
         int samples = mp3dec_decode_frame(&dec, ptr, remaining, pcm, &info);
         if (info.frame_bytes == 0) break;
         ptr       += info.frame_bytes;
@@ -218,6 +270,7 @@ esp_err_t boot_sound_play(uint8_t volume)
     }
 
     esp_codec_dev_close(spk);
+    fclose(fp);
     ESP_LOGI(TAG, "Playback complete%s", s_stop_req ? " (stopped early)" : "");
     return ESP_OK;
 }

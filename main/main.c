@@ -184,7 +184,7 @@ static volatile bool g_trip_reset       = false;
  * just the same clip louder), and it preempts — see the dispatcher below. */
 typedef enum {
     SND_NONE = 0,
-    SND_CHIME,   /* boot jingle / tap feedback (the embedded MP3) */
+    SND_CHIME,   /* boot jingle / tap feedback (MP3 streamed from the SD card) */
     SND_ERROR,   /* synthesised two-tone fault alarm              */
 } sound_id_t;
 
@@ -688,7 +688,13 @@ static void telemetry_task(void *arg)
             ESP_LOGI(TAG, "TRIP RESET");
         }
 
-        if (g_save_dirty) {
+        /* Defer the periodic/event save while the boot jingle is streaming off
+         * the SD card — concurrent FATFS access from both would fight over the
+         * same card and risk audible stutter (or worse). Left set, so it fires
+         * on a later pass once the chime finishes; not time-critical like the
+         * PLP path in save_mileage_fast(), which is deliberately NOT gated
+         * here — it must never wait on anything. */
+        if (g_save_dirty && s_sound_current != SND_CHIME) {
             g_save_dirty = false;
             save_mileage();
         }
