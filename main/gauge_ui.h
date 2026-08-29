@@ -39,3 +39,9 @@ void gauge_ui_set_alert_sound_cb(void (*cb)(void));
  * Use to trigger a brightness step via a flag — do not call LVGL or
  * blocking functions directly inside the callback. */
 void gauge_ui_set_brightness_cb(void (*cb)(void));
+
+/* Set the needle-pivot hub ring color: true = green (a PLP/power-fail save
+ * has landed on disk — either just now, or confirmed at boot), false = red
+ * (a normal/periodic save, or nothing confirmed since going into Run). Must
+ * be called from LVGL task context (i.e. with the display already locked). */
+void gauge_ui_set_hub_ok(bool ok);

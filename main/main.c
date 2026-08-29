@@ -37,20 +37,13 @@ static const char *TAG = "speedometer";
 #define BLINK_INTERVAL_MS 400
 #define SOUND_VOLUME      100         /* speaker volume 0–100 */
 
-/* SD card mileage file. Every layout shares MILEAGE_MAGIC and is a prefix of the
- * next EXCEPT v2, whose field order differs (it predates charge_mi):
- *   legacy (20 bytes): magic + total_mi + trip_mi
- *   v2     (44 bytes): + total_wh + trip_wh + charge_wh   [no charge_mi]
- *   v3     (52 bytes): + charge_mi, Wh fields shifted     [no last_soc]
- *   current(60 bytes): + last_soc
- * load_mileage() reads whichever length is on disk. Because current is a strict
- * append onto v3, a v3 card is migrated by simply reading its first 52 bytes —
- * the fields land in the right place and last_soc defaults to 0. Only v2 needs a
- * real remap (see mileage_file_v2_t). */
+/* SD card mileage file. v4 (60 bytes) is a strict prefix of current (61 bytes) —
+ * a v4 card is migrated by simply reading its first 60 bytes; save_is_pfail
+ * defaults to 0 ("not a PLP save"). Earlier layouts (legacy/v2/v3) no longer
+ * occur in the field and are no longer accepted. */
 #define MILEAGE_FILE          BSP_SD_MOUNT_POINT "/odometer.bin"
 #define MILEAGE_MAGIC         0xA55A1234U
-#define MILEAGE_LEGACY_BYTES  20           /* sizeof the pre-energy layout */
-#define MILEAGE_V3_BYTES      52           /* pre-last_soc layout           */
+#define MILEAGE_V4_BYTES      60           /* pre-save-flag layout          */
 
 /* Reject an implausible frame-to-frame jump in the IVT energy counter (a shunt
  * reset, a dropped/garbled frame). Well above one telemetry tick of real drive
@@ -66,22 +59,9 @@ typedef struct __attribute__((packed)) {
     double   trip_wh;     /* energy since last trip reset, Wh             */
     double   charge_wh;   /* energy since last transition into Charge, Wh */
     double   last_soc;    /* last SOC seen with the contactors closed, %  */
+    uint8_t  save_is_pfail; /* 1 = written by save_mileage_fast() (PLP button),
+                              * 0 = written by save_mileage() (periodic/event) */
 } mileage_file_t;
-
-/* Intermediate layout that shipped briefly between the legacy file and the
- * current one: it had the three Wh counters but no charge_mi. A card written by
- * that firmware is 44 bytes; without this migration it matches neither the
- * legacy nor the current length and would be rejected outright — silently
- * resetting the odometer. Field order here must match that build exactly. */
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    double   total_mi;
-    double   trip_mi;
-    double   total_wh;
-    double   trip_wh;
-    double   charge_wh;
-} mileage_file_v2_t;
-#define MILEAGE_V2_BYTES  44
 
 static bool s_sd_mounted = false;
 
@@ -114,6 +94,12 @@ static bool   s_was_charge_mode  = false; /* tracks CAR_MODE_CHARGE edge        
  * reads something meaningful when you walk up to a parked car. */
 static double g_last_soc = 0.0;
 static bool   s_was_bus_live = false;   /* tracks the Run/Charge -> off edge */
+
+/* Whether the odometer.bin on disk at boot was written by the PLP (power-fail)
+ * button rather than a normal/periodic save. Drives the hub ring color: green
+ * until the car goes into Run, then red for the rest of the drive — see
+ * gauge_ui_set_hub_ok(). */
+static bool g_last_save_is_pfail = false;
 
 /* ── Rolling efficiency window ────────────────────────────────────────────────
  * Wh/mile over the last ROLL_WINDOW_MI of TRIP distance, so it resets with the
@@ -180,6 +166,12 @@ static volatile bool g_mileage_dirty    = false;
 static volatile bool g_blink_dirty      = false;
 static volatile bool g_save_dirty       = false;
 static volatile bool g_trip_reset       = false;
+
+/* Hub ring color command — set from button_task (a pfail write) or
+ * telemetry_task (the Run edge) and applied by telemetry_task under the
+ * display lock. HUB_NONE means no pending change. */
+typedef enum { HUB_NONE = 0, HUB_GREEN, HUB_RED } hub_cmd_t;
+static volatile hub_cmd_t g_hub_cmd = HUB_NONE;
 /* Which sound to play. The fault alarm is a different sound from the chime (not
  * just the same clip louder), and it preempts — see the dispatcher below. */
 typedef enum {
@@ -359,11 +351,8 @@ static void load_mileage(void)
     if (s_sd_mounted) {
         FILE *fp = fopen(MILEAGE_FILE, "rb");
         if (fp) {
-            /* Read whichever layout is on disk. Three are accepted:
-             *   20 bytes — legacy (pre-energy): odometer only
-             *   44 bytes — intermediate (energy, no charge_mi)
-             *   52 bytes — current
-             * Anything else is rejected. The missing fields default to 0. */
+            /* Read whichever layout is on disk. Anything shorter than v4 is
+             * rejected; the missing tail of an accepted layout defaults to 0. */
             fseek(fp, 0, SEEK_END);
             long sz = ftell(fp);
             fseek(fp, 0, SEEK_SET);
@@ -374,33 +363,13 @@ static void load_mileage(void)
             bool read_ok = false;
 
             if (sz >= (long)sizeof(f)) {
-                layout  = "current(60)";
+                layout  = "current(61)";
                 read_ok = (fread(&f, sizeof(f), 1, fp) == 1);
-            } else if (sz == MILEAGE_V3_BYTES) {
-                /* Strict prefix of the current layout — the fields land where
-                 * they belong; only last_soc is missing (stays 0 from memset). */
-                layout  = "v3(52)";
-                read_ok = (fread(&f, MILEAGE_V3_BYTES, 1, fp) == 1);
-            } else if (sz == MILEAGE_V2_BYTES) {
-                /* Migrate the intermediate layout: same fields but no charge_mi,
-                 * so the Wh values sit 8 bytes earlier than they do now. Read it
-                 * in its own shape and map across rather than reinterpreting. */
-                mileage_file_v2_t v2;
-                memset(&v2, 0, sizeof(v2));
-                layout  = "intermediate(44)";
-                read_ok = (fread(&v2, sizeof(v2), 1, fp) == 1);
-                if (read_ok) {
-                    f.magic     = v2.magic;
-                    f.total_mi  = v2.total_mi;
-                    f.trip_mi   = v2.trip_mi;
-                    f.charge_mi = 0.0;          /* field didn't exist yet */
-                    f.total_wh  = v2.total_wh;
-                    f.trip_wh   = v2.trip_wh;
-                    f.charge_wh = v2.charge_wh;
-                }
-            } else if (sz == MILEAGE_LEGACY_BYTES) {
-                layout  = "legacy(20)";
-                read_ok = (fread(&f, MILEAGE_LEGACY_BYTES, 1, fp) == 1);
+            } else if (sz == MILEAGE_V4_BYTES) {
+                /* Strict prefix of the current layout — only save_is_pfail is
+                 * missing (stays 0 from memset, i.e. "not a PLP save"). */
+                layout  = "v4(60)";
+                read_ok = (fread(&f, MILEAGE_V4_BYTES, 1, fp) == 1);
             }
             fclose(fp);
 
@@ -414,9 +383,9 @@ static void load_mileage(void)
                             && isfinite(f.last_soc)  && f.last_soc >= 0.0
                                                      && f.last_soc <= 100.0;
 
-            ESP_LOGI(TAG, "SD: odometer.bin %ld bytes, layout=%s, read=%d magic=%d(0x%08lX) vals=%d",
+            ESP_LOGI(TAG, "SD: odometer.bin %ld bytes, layout=%s, read=%d magic=%d(0x%08lX) vals=%d pfail=%d",
                      sz, layout, (int)read_ok, (int)magic_ok,
-                     (unsigned long)f.magic, (int)vals_ok);
+                     (unsigned long)f.magic, (int)vals_ok, (int)f.save_is_pfail);
 
             if (vals_ok) {
                 g_total_mi  = f.total_mi;
@@ -426,6 +395,7 @@ static void load_mileage(void)
                 g_trip_wh   = f.trip_wh;
                 g_charge_wh = f.charge_wh;
                 g_last_soc  = f.last_soc;
+                g_last_save_is_pfail = (f.save_is_pfail != 0);
                 log_counters("LOAD");
                 return;
             }
@@ -462,13 +432,14 @@ static void save_mileage_fast(void)
         return;
     }
     mileage_file_t f = { MILEAGE_MAGIC, g_total_mi, g_trip_mi, g_charge_mi,
-                         g_total_wh, g_trip_wh, g_charge_wh, g_last_soc };
+                         g_total_wh, g_trip_wh, g_charge_wh, g_last_soc, 1 };
     FILE *fp = fopen(MILEAGE_FILE, "wb");
     if (fp) {
         size_t n = fwrite(&f, 1, sizeof(f), fp);
         fclose(fp);
         ESP_LOGI(TAG, "SAVE(PLP) wrote %u/%u bytes", (unsigned)n, (unsigned)sizeof(f));
         log_counters("SAVE(PLP)");
+        if (n == sizeof(f)) g_hub_cmd = HUB_GREEN;   /* live feedback for testing the pfail path */
     } else {
         ESP_LOGW(TAG, "PLP: SD write failed");
     }
@@ -479,7 +450,7 @@ static void save_mileage(void)
     /* SD card — primary */
     if (s_sd_mounted) {
         mileage_file_t f = { MILEAGE_MAGIC, g_total_mi, g_trip_mi, g_charge_mi,
-                             g_total_wh, g_trip_wh, g_charge_wh, g_last_soc };
+                             g_total_wh, g_trip_wh, g_charge_wh, g_last_soc, 0 };
         FILE *fp = fopen(MILEAGE_FILE, "wb");
         if (fp) {
             size_t n = fwrite(&f, 1, sizeof(f), fp);
@@ -572,11 +543,14 @@ static void telemetry_task(void *arg)
             if (new_speed < 1.0f && prev_speed >= 1.0f)
                 g_save_dirty = true;
 
-            /* Play the start sound on the rising edge into Run mode */
+            /* Play the start sound on the rising edge into Run mode. This also
+             * invalidates the hub ring: it only shows green when the file on
+             * disk is a confirmed PLP save from before this drive started. */
             bool is_run_mode = (t.opmode == CAR_MODE_RUN);
             if (is_run_mode && !s_was_run_mode) {
                 g_sound_volume_req = SOUND_VOLUME;
                 g_sound_req = SND_CHIME;
+                g_hub_cmd = HUB_RED;
             }
             s_was_run_mode = is_run_mode;
 
@@ -661,7 +635,7 @@ static void telemetry_task(void *arg)
 
         /* Acquire the lock once per cycle for all pending LVGL work.
          * 500 ms timeout rides out the adapter's lv_timer_handler() render. */
-        if (need_telemetry || g_mileage_dirty || g_blink_dirty || g_energy_dirty) {
+        if (need_telemetry || g_mileage_dirty || g_blink_dirty || g_energy_dirty || g_hub_cmd != HUB_NONE) {
             if (bsp_display_lock(500) == ESP_OK) {
                 if (need_telemetry)      gauge_ui_update_telemetry(&t);
                 if (g_mileage_dirty)   { g_mileage_dirty = false; gauge_ui_update_mileage(g_total_mi, g_trip_mi); }
@@ -673,6 +647,11 @@ static void telemetry_task(void *arg)
                                            g_charge_wh, g_charge_mi, rwh, rmi);
                 }
                 if (g_blink_dirty)     { g_blink_dirty   = false; gauge_ui_blink_tick(); }
+                if (g_hub_cmd != HUB_NONE) {
+                    hub_cmd_t cmd = g_hub_cmd;
+                    g_hub_cmd = HUB_NONE;
+                    gauge_ui_set_hub_ok(cmd == HUB_GREEN);
+                }
                 bsp_display_unlock();
             }
         }
@@ -750,12 +729,15 @@ static void IRAM_ATTR btn_isr(void *arg)
 
 static void button_task(void *arg)
 {
+    /* Idle-high via the internal pull-up. The PLP circuit holds the pin low
+     * while 12V is present and releases it (pull-up wins, goes high) when
+     * 12V drops — so the save must fire on the RISING edge, level == 1. */
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << BTN_PFAIL),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
+        .intr_type    = GPIO_INTR_POSEDGE,
     };
     gpio_config(&io);
 
@@ -773,7 +755,7 @@ static void button_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10));              /* debounce */
 
         TickType_t now = xTaskGetTickCount();
-        if (gpio_get_level(BTN_PFAIL) == 0 &&
+        if (gpio_get_level(BTN_PFAIL) == 1 &&
             (now - last_trigger) >= pdMS_TO_TICKS(1000)) {
             last_trigger = now;
             save_mileage_fast();   /* SD only — no NVS flash erase */
@@ -850,6 +832,7 @@ void app_main(void)
     /* Build gauge UI */
     bsp_display_lock(-1);
     gauge_ui_init(lv_screen_active());
+    gauge_ui_set_hub_ok(g_last_save_is_pfail);
     gauge_ui_update_mileage(g_total_mi, g_trip_mi);
     {
         double rwh, rmi;

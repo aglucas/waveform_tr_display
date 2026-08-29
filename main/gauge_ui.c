@@ -77,6 +77,7 @@ static const thresh_t TH_UDC = { 270, 300, 400, 410 };
 /* Widget handles */
 static lv_obj_t *g_scale;
 static lv_obj_t *g_needle;
+static lv_obj_t *g_hub;
 static lv_obj_t *g_soc_inner;
 static lv_obj_t *g_temp_inner;
 static lv_obj_t *g_temp_outer;
@@ -404,10 +405,11 @@ void gauge_ui_init(lv_obj_t *parent)
     lv_obj_add_style(g_needle, &s_needle_line, 0);
     lv_scale_set_line_needle_value(g_scale, g_needle, NEEDLE_LEN, 0);
 
-    /* Hub dot — clickable for brightness control */
-    lv_obj_t *hub = circle(parent, CX, CY, WARN_OUTER_R, COL_RED);
-    lv_obj_add_flag(hub, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(hub, hub_click_cb, LV_EVENT_CLICKED, NULL);
+    /* Hub dot — clickable for brightness control; color reports whether the
+     * odometer save on disk was a confirmed PLP save (see gauge_ui_set_hub_ok). */
+    g_hub = circle(parent, CX, CY, WARN_OUTER_R, COL_RED);
+    lv_obj_add_flag(g_hub, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(g_hub, hub_click_cb, LV_EVENT_CLICKED, NULL);
 
     /* SOC warning indicator */
     circle(parent, SOC_X, WARN_Y, WARN_OUTER_R, COL_WHITE);
@@ -671,6 +673,11 @@ void gauge_ui_set_alert_sound_cb(void (*cb)(void))
 void gauge_ui_set_brightness_cb(void (*cb)(void))
 {
     s_brightness_cb = cb;
+}
+
+void gauge_ui_set_hub_ok(bool ok)
+{
+    lv_obj_set_style_bg_color(g_hub, ok ? COL_GREEN : COL_RED, 0);
 }
 
 /* ─── gauge_ui_blink_tick ───────────────────────────────────────────────── */
