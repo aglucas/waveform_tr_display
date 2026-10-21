@@ -557,12 +557,14 @@ static void telemetry_task(void *arg)
             /* Integrate the IVT cumulative energy counter into our trip/lifetime/
              * charge totals. The first frame only latches the baseline (no delta
              * yet); a jump beyond ENERGY_MAX_STEP_WH (shunt reset / bad frame) is
-             * discarded rather than accumulated. */
+             * discarded rather than accumulated. Energy put IN while charging is
+             * kept out of every meter: the baseline still follows the counter
+             * each frame, so driving picks up from the post-charge value. */
             static uint32_t s_energy_rejects = 0;
             double e = (double)t.energy_wh;
             double d = 0.0;
             bool   rejected = false;
-            if (g_energy_have_prev) {
+            if (g_energy_have_prev && t.opmode != CAR_MODE_CHARGE) {
                 d = e - g_energy_prev;
                 if (fabs(d) < ENERGY_MAX_STEP_WH) {
                     g_total_wh  += d;
@@ -573,7 +575,7 @@ static void telemetry_task(void *arg)
                     rejected = true;
                     s_energy_rejects++;
                 }
-            } else {
+            } else if (!g_energy_have_prev) {
                 ESP_LOGI(TAG, "IVT: baseline latched at %.2f Wh", e);
             }
             g_energy_prev = e;
@@ -664,6 +666,7 @@ static void telemetry_task(void *arg)
             roll_reset();           /* M is trip-based, so it resets with the trip */
             g_mileage_dirty = true;
             g_energy_dirty  = true;
+            g_save_dirty    = true;   /* persist it — a power loss must not restore the old trip */
             ESP_LOGI(TAG, "TRIP RESET");
         }
 
